@@ -18,6 +18,7 @@ import torch as th
 import torch.nn.functional as F
 import numpy as np
 import sys
+import cv2
 
 from . import kernelFunction
 
@@ -356,3 +357,32 @@ def create_image_pyramid(image, down_sample_factor):
         sys.exit(-1)
 
     return image_pyramide
+
+
+def toNP(x):
+    return x.cpu().detach().numpy()
+
+def mask_border(mask):
+    mask[0,:]=255
+    mask[-1,:]=255
+    mask[:,0]=255
+    mask[:,-1]=255
+    return mask
+
+def get_mask(i1,i2):
+    from skimage import morphology
+    if np.max(i1)<=1.0:
+        i1 = (i1*255).astype(np.uint8)
+        i2 = (i2*255).astype(np.uint8)
+    _, thresh1 = cv2.threshold(i1, 1, 255, cv2.THRESH_BINARY_INV)
+    _, thresh2 = cv2.threshold(i2, 1, 255, cv2.THRESH_BINARY_INV)
+    # always mask border pixels
+
+    for _ in range(3):
+        thresh1 = morphology.binary_dilation(thresh1)
+        thresh2 = morphology.binary_dilation(thresh2)
+    thresh1 = mask_border(thresh1)
+    thresh2 = mask_border(thresh2)
+
+    mask = np.logical_or(thresh1, thresh2)
+    return mask

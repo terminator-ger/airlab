@@ -20,6 +20,7 @@ import numpy as np
 from .. import transformation as T
 from ..transformation import utils as tu
 from ..utils import kernelFunction as utils
+from ..utils.image import toNP, get_mask
 
 
 
@@ -576,3 +577,304 @@ class SSIM(_PairwiseImageLoss):
 
         return self.return_loss(value)
 
+
+class kernelNTG(_PairwiseImageLoss):
+    def __init__(self,
+                 fixed_image,
+                 moving_image,
+                 fixed_mask=None,
+                 moving_mask=None,
+                 size_average=True,
+                 reduce=True,
+                 kernel='sobel',
+                 percent=0.02,
+                 size=3,
+                 weight=False,
+                 debug=False):
+
+        super(kernelNTG, self).__init__(fixed_image, moving_image, fixed_mask, moving_mask, size_average, reduce)
+        self._name = "kernelNTG"
+        self.warped_moving_image = None
+        self.m = np.array([0])
+        self.debug = debug
+        self.kernel=kernel
+        self.size=size
+        self.weight=weight
+        self.percent=percent
+
+        # definition of different kernels to be used:
+        self.sobel3_x = th.Tensor([[-1,0,1],
+                             [-2,0,2],
+                             [-1,0,1]]).float().to(self._device).view(1,1,3,3)
+
+        self.sobel3_y = th.Tensor([[-1,-2,-1],
+                             [0,0,0],
+                             [1,2,1]]).float().to(self._device).view(1,1,3,3)
+
+        self.scharr3_x = th.Tensor([[-47,0,47],
+                             [-162,0,162],
+                             [-47,0,47]]).float().to(self._device).view(1,1,3,3)
+
+        self.scharr3_y = th.Tensor([[-47,-162,-47],
+                             [0,0,0],
+                             [47,162,47]]).float().to(self._device).view(1,1,3,3)
+
+        self.sobel5_x = th.Tensor([[-1, -2, 0, 2, 1],
+                              [-4, -8, 0, 8, 4],
+                              [-6, -12,0,12, 6],
+                              [-4, -8, 0, 8, 4],
+                              [-1, -2, 0, 2, 1]]).float().to(self._device).view(1,1,5,5)
+
+        self.sobel5_y = th.Tensor([[-1,-4, -6, -4,-1],
+                              [-2, -8, -12, -8, -2],
+                              [0,0,0,0,0],
+                              [2, 8, 12, 8, 2],
+                              [1,4, 6, 4, 1]]).float().to(self._device).view(1,1,5,5)
+        if self.size==3:
+            padding=1
+        elif self.size==5:
+            padding=2
+
+        self.dx = th.nn.functional.conv2d(in_channels=1,
+                          out_channels=1,
+                          kernel_size=(self.size,self.size),
+                          stride=1,
+                          padding=padding,
+                          groups=1,
+                          bias=False)
+        self.dy = th.nn.Conv2d(in_channels=1,
+                          out_channels=1,
+                          kernel_size=(self.size,self.size),
+                          stride=1,
+                          padding=padding,
+                          groups=1,
+                          bias=False)
+
+        if self.kernel=='sobel' and self.size==3:
+            self.dx.weight.data = self.sobel3_x
+            self.dy.weight.data = self.sobel3_y
+        elif self.kernel=='sobel' and self.size==5:
+            self.dx.weight.data = self.sobel5_x
+            self.dy.weight.data = self.sobel5_y
+        elif self.kernel=='scharr' and self.size==3:
+            self.dx.weight.data = self.scharr3_x
+            self.dy.weight.data = self.scharr3_y
+
+        self.dx.weight.requires_grad = True
+        self.dy.weight.requires_grad = True
+
+
+        if self.debug:
+            from  matplotlib import pyplot as plt
+            img1 = self._moving_image.image.cpu().detach().numpy()[0, 0]
+            img2 = self._fixed_image.image.cpu().detach().numpy()[0, 0]
+            self.plt = plt.imshow(np.dstack((img1,img2,img1)))
+            plt.ion()
+            plt.show()
+
+
+    def GetCurrentMask(self, displacement):
+        import skimage
+        """
+        Computes a mask defining if pixels are warped outside the image domain, or if they fall into
+        a fixed image mask or a warped moving image mask.
+        return (Tensor): maks array
+        """
+        # exclude points which are transformed outside the image domain
+
+        mask = get_mask(toNP(self._fixed_image.image)[0,0], toNP(self.warped_moving_image)[0,0])
+
+        mask2 = mask
+        for _ in range(3):
+            mask2 = skimage.morphology.binary_dilation(mask2)
+
+        mask2 = th.from_numpy(mask2)
+        mask2 = mask2[None,None,:,:]
+
+        mask = th.from_numpy(mask)
+        mask = mask[None,None,:,:]
+
+        return mask.to(self._device), mask2.to(self._device)
+
+
+    def forward(self, displacement):
+        from matplotlib import pyplot as plt
+
+        def weight_lower_percent(mat,mask):
+            """
+            Weighting that suppresses the lower percent gradients
+            :param mat:     gradient matrix
+            :param mask:    mask matrix
+            :return:        matrix with weights for each pixel
+            """
+            mat_=mat.masked_select(~mask)
+            m = th.max(mat_)
+            weight = th.zeros(mat.shape).to(self._device)
+            weight[mat>(self.percent*m)] = 1.0
+            return weight
+
+        # compute displacement field
+        displacement = self._grid + displacement
+
+        # warp moving image with dispalcement field
+        self.warped_moving_image = F.grid_sample(self._moving_image.image, displacement)
+
+        # compute current mask
+        mask,mask2 = self.GetCurrentMask(displacement)
+
+        mov = self.warped_moving_image.masked_fill(mask,0)
+        fix = self._fixed_image.image.masked_fill(mask,0)
+
+        i1x = th.abs(self.dx(mov))
+        i1y = th.abs(self.dy(mov))
+        i2x = th.abs(self.dx(fix))
+        i2y = th.abs(self.dy(fix))
+
+        #weight
+        if self.weight:
+            i1x = i1x*weight_lower_percent(i1x,mask2)
+            i1y = i1y*weight_lower_percent(i1y,mask2)
+            i2x = i2x*weight_lower_percent(i2x,mask2)
+            i2y = i2y*weight_lower_percent(i2y,mask2)
+
+        dx = th.abs(i1x-i2x)
+        dy = th.abs(i1y-i2y)
+
+        # add narrower mask
+        m  = (dx+dy).masked_fill(mask2,0).sum()
+        n1 = (i1x+i1y).masked_fill(mask2,0).sum()
+        n2 = (i2x+i2y).masked_fill(mask2,0).sum()
+
+        metric = th.div(m, th.add(n1,n2))
+
+
+        if self.debug:
+            mov = (self.warped_moving_image).cpu().detach().numpy()[0, 0]
+            fix = (self._fixed_image.image).cpu().detach().numpy()[0, 0]
+
+            self.plt.set_data(np.dstack((mov,fix,mov)))
+            plt.draw()
+            plt.pause(0.0001)
+        return metric
+
+
+class NTG(_PairwiseImageLoss):
+    def __init__(self,
+                 fixed_image,
+                 moving_image,
+                 fixed_mask=None,
+                 moving_mask=None,
+                 size_average=True,
+                 reduce=True,
+                 debug=False):
+        super(NTG, self).__init__(fixed_image, moving_image, fixed_mask, moving_mask, size_average, reduce)
+        self._name = "NTG"
+        self.warped_moving_image = None
+        self.m = np.array([0])
+        self.debug = debug
+
+
+        self.dx = th.nn.Conv2d(in_channels=1,
+                          out_channels=1,
+                          kernel_size=(1,2),
+                          stride=1,
+                          padding=0,
+                          groups=1,
+                          bias=False)
+
+        kernel = th.tensor([1.0, -1.0]).to(self._device)
+        self.dx.weight.data = kernel.view(1,1,1,2)
+
+        self.dy = th.nn.Conv2d(in_channels=1,
+                          out_channels=1,
+                          kernel_size=(2,1),
+                          stride=1,
+                          padding=0,
+                          groups=1,
+                          bias=False)
+
+        self.dy.weight.data = kernel.view(1,1,2,1)
+        if debug:
+            from  matplotlib import pyplot as plt
+            img1 = self._moving_image.image.cpu().detach().numpy()[0, 0]
+            img2 = self._fixed_image.image.cpu().detach().numpy()[0, 0]
+            self.plt = plt.imshow(np.dstack((img1,img2,img1)))
+            plt.ion()
+            plt.show()
+
+
+    def GetCurrentMask(self, displacement):
+        import skimage
+        """
+        Computes a mask defining if pixels are warped outside the image domain, or if they fall into
+        a fixed image mask or a warped moving image mask.
+        return (Tensor): maks array
+        """
+        # exclude points which are transformed outside the image domain
+        mask = get_mask(toNP(self._fixed_image.image)[0,0], toNP(self.warped_moving_image)[0,0])
+
+        mask2 = mask
+        for _ in range(3):
+            mask2 = skimage.morphology.binary_dilation(mask2)
+
+        mask2 = th.from_numpy(mask2)
+        mask2 = mask2[None,None,:,:]
+
+        mask = th.from_numpy(mask)
+        mask = mask[None,None,:,:]
+
+
+        return mask.to(self._device),mask2.to(self._device)
+
+
+    def forward(self, displacement):
+        from matplotlib import pyplot as plt
+
+        # compute displacement field
+        displacement = self._grid + displacement
+
+        # warp moving image with dispalcement field
+        self.warped_moving_image = F.grid_sample(self._moving_image.image, displacement)
+
+        # compute current mask
+        mask,mask2 = self.GetCurrentMask(displacement)
+
+        mov = self.warped_moving_image.masked_fill(mask.bool(),0)
+        fix = self._fixed_image.image.masked_fill(mask.bool(),0)
+
+        i1x = th.abs(self.dx(mov))
+        i1y = th.abs(self.dy(mov))
+        i2x = th.abs(self.dx(fix))
+        i2y = th.abs(self.dy(fix))
+
+        delta = mov-fix
+        dx = th.abs(self.dx(delta))
+        dy = th.abs(self.dy(delta))
+
+        xpad = th.nn.ZeroPad2d((0,1,0,0))
+        ypad = th.nn.ZeroPad2d((0,0,0,1))
+        i1x = xpad(i1x)
+        i2x = xpad(i2x)
+        dx = xpad(dx)
+        i1y = ypad(i1y)
+        i2y = ypad(i2y)
+        dy  = ypad(dy)
+
+        # add mask
+        m  = (dx+dy).masked_fill(mask2.bool(),0).sum()
+        n1 = (i1x+i1y).masked_fill(mask2.bool(),0).sum()
+        n2 = (i2x+i2y).masked_fill(mask2.bool(),0).sum()
+
+
+        metric = th.div(m, th.add(n1,n2))
+        if self.debug:
+            img1 = (delta).cpu().detach().numpy()[0, 0]
+            img2 = (i1x-i2x).cpu().detach().numpy()[0, 0]
+            img3 = (i1y-i2y).cpu().detach().numpy()[0, 0]
+            mov = (self.warped_moving_image).cpu().detach().numpy()[0, 0]/255
+            fix = (self._fixed_image.image).cpu().detach().numpy()[0, 0]/255
+
+            self.plt.set_data(np.dstack((mov,fix,mov)))
+            plt.draw()
+            plt.pause(0.0001)
+        return metric

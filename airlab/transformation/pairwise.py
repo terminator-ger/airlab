@@ -457,6 +457,108 @@ class AffineTransformation(SimilarityTransformation):
         return self._concatenate_flows(flow)
 
 
+
+class PerspectiveTransformation(AffineTransformation):
+    """
+    Perspective centred transformation for 2D and 3D.
+
+    Args:
+        moving_image (Image): moving image for the registration
+        opt_cm (bool): using center of as parameter for the optimisation
+    """
+    def __init__(self, moving_image, opt_cm=False):
+        super(PerspectiveTransformation, self).__init__(moving_image, opt_cm)
+
+        self._px = th.nn.parameter.Parameter(th.tensor(0.0))
+        self._py = th.nn.parameter.Parameter(th.tensor(0.0))
+
+        self._homogenus = None
+
+        if self._opt_cm:
+            self._center_mass_x = th.nn.parameter.Parameter(self._center_mass_x)
+            self._center_mass_y = th.nn.parameter.Parameter(self._center_mass_y)
+
+        if self._dim == 2:
+            self._compute_displacement = self._compute_transformation_2d
+            self._compute_flow = self._compute_dense_flow
+        else:
+            # Not implemented
+            print('not implemented')
+#                self._compute_displacement = self._compute_transformation_3d
+#
+#                self._shear_z_x = Parameter(th.tensor(0.0))
+#                self._shear_z_y = Parameter(th.tensor(0.0))
+#                self._shear_x_z = Parameter(th.tensor(0.0))
+#                self._shear_y_z = Parameter(th.tensor(0.0))
+
+    def set_parameters(self, t, phi, scale, shear, distort, rotation_center=None):
+        """
+        Set parameters manually
+
+        t (array): 2 or 3 dimensional array specifying the spatial translation
+        phi (array): 1 or 3 dimensional array specifying the rotation angles
+        scale (array): 2 or 3 dimensional array specifying the scale in each dimension
+        shear (array): 2 or 6 dimensional array specifying the shear in each dimension: yx, xy, zx, zy, xz, yz
+        distort (array): 2 dimensional array specifying the homographic distortion in each dimension x,y
+        rotation_center (array): 2 or 3 dimensional array specifying the rotation center (default is zeros)
+        """
+        # pass args to affine transformation
+        super(PerspectiveTransformation, self).set_parameters(t, phi, scale, shear, rotation_center)
+
+        self._px = th.nn.parameter.Parameter(th.tensor(distort[0]).to(dtype=self._dtype, device=self._device))
+        self._py = th.nn.parameter.Parameter(th.tensor(distort[1]).to(dtype=self._dtype, device=self._device))
+
+       # if len(t) == 2:
+       #     self._compute_transformation_2d()
+       # else:
+       #     print('not implemented')
+            #self._shear_z_x = Parameter(th.tensor(shear[2]).to(dtype=self._dtype, device=self._device))
+            #self._shear_z_y = Parameter(th.tensor(shear[3]).to(dtype=self._dtype, device=self._device))
+            #self._shear_x_z = Parameter(th.tensor(shear[4]).to(dtype=self._dtype, device=self._device))
+            #self._shear_y_z = Parameter(th.tensor(shear[5]).to(dtype=self._dtype, device=self._device))
+            #self._compute_transformation_3d()
+
+    def _compute_transformation_2d(self):
+        super(PerspectiveTransformation, self)._compute_transformation_2d()
+        self._homogenus = th.diag(th.ones(self._dim + 1, dtype=self._dtype, device=self._device))
+
+        self._homogenus[2, 0] = self._px
+        self._homogenus[2, 1] = self._py
+
+
+
+
+    def _compute_transformation_matrix(self):
+        transformation_matrix = th.mm(th.mm(th.mm(th.mm(th.mm(th.mm(self._trans_matrix_pos, self._trans_matrix_cm),
+                                                            self._rotation_matrix),
+                                                        self._scale_matrix),
+                                                 self._shear_matrix),
+                                    self._homogenus),
+                        self._trans_matrix_cm_rw)
+
+        return transformation_matrix
+
+    def _compute_dense_flow(self, transformation_matrix=th.eye(3)):
+        if  transformation_matrix.cpu().equal(th.eye(3)):
+            transformation_matrix = self._compute_transformation_matrix()
+
+        displacement = th.mm(self._grid.view(np.prod(self._image_size).tolist(), self._dim + 1),
+                         transformation_matrix.t()).view(*(self._image_size.tolist()), 3)
+        displacement = th.div(displacement[:, :, :self._dim], displacement[:, :, self._dim].view(*(self._image_size).tolist(), 1))
+        displacement = displacement - self._grid[..., :self._dim]
+        return displacement
+
+    def get_transformation_matrix(self):
+        return self._compute_transformation_matrix().cpu().detach().numpy()
+
+    def forward(self):
+        self._compute_transformation()
+        transformation_matrix = self._compute_transformation_matrix()
+        flow = self._compute_dense_flow(transformation_matrix)
+        return self._concatenate_flows(flow)
+
+
+
 class NonParametricTransformation(_Transformation):
     r"""
         None parametric transformation
@@ -650,3 +752,5 @@ class WendlandKernelTransformation(_KernelTransformation):
         self._kernel = self._kernel.to(dtype=dtype, device=self._device)
 
         self._initialize()
+
+
