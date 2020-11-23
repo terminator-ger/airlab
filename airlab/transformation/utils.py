@@ -17,6 +17,7 @@ import torch.nn.functional as F
 
 from ..utils import image as iutils
 
+import SimpleITK as sitk
 
 def compute_grid(image_size, dtype=th.float32, device='cpu'):
 
@@ -109,21 +110,47 @@ def displacement_to_unit_displacement(displacement):
     # scale displacements from image
     # domain to 2square
     # - last dimension are displacements
-    for dim in range(displacement.shape[-1]):
-        displacement[..., dim] = 2.0 * displacement[..., dim] / float(displacement.shape[-dim - 2] - 1)
+    if type(displacement) == iutils.Displacement:
+        df = displacement.image
+    else:
+        df = displacement
+
+    for dim in range(df.shape[-1]):
+        df[..., dim] = 2.0 * df[..., dim] / float(df.shape[-dim - 2] - 1)
+
     return displacement
 
 
 """
-    Convert a unit displacement to a  itk like displacement
+    Convert a unit displacement to a displacement field with the right spacing/scale
 """
-def unit_displacement_to_dispalcement(displacement):
+def unit_displacement_to_displacement(displacement):
     # scale displacements from 2square
     # domain to image domain
     # - last dimension are displacements
-    for dim in range(displacement.shape[-1]):
-        displacement[..., dim] = float(displacement.shape[-dim - 2] - 1) * displacement[..., dim] / 2.0
+    if type(displacement) == iutils.Displacement:
+        df = displacement.image
+    else:
+        df = displacement
+
+    # manipulate displacement field
+    for dim in range(df.shape[-1]):
+        df[..., dim] = float(df.shape[-dim - 2] - 1) * df[..., dim] / 2.0
+
     return displacement
+
+def get_displacement_itk(displacement, refIm):
+    displacement = displacement.detach().clone()
+    dim = len(displacement.shape) - 1
+    unit_displacement_to_displacement(displacement)
+    dispIm = sitk.GetImageFromArray(
+        displacement.cpu().numpy().astype('float64')\
+        .transpose(list(range(dim-1, -1, -1)) + [dim])[..., ::-1],  # simpleitk image in numpy: D, H, W
+        isVector=True
+    )
+    dispIm.CopyInformation(refIm)
+    trans = sitk.DisplacementFieldTransform(dispIm)
+    return trans
 
 """
     Create a 3d rotation matrix
