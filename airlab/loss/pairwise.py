@@ -16,12 +16,13 @@ import torch as th
 import torch.nn.functional as F
 
 import numpy as np
+import matplotlib.pyplot as plt
 
 from .. import transformation as T
 from ..transformation import utils as tu
 from ..utils import kernelFunction as utils
 from ..utils.image import toNP, get_mask
-
+import pdb
 
 
 # Loss base class (standard from PyTorch)
@@ -120,8 +121,15 @@ class MSE(_PairwiseImageLoss):
         super(MSE, self).__init__(fixed_image, moving_image, fixed_mask, moving_mask, size_average, reduce)
 
         self._name = "mse"
-
+        self.debug=True
         self.warped_moving_image = None
+        if self.debug:
+            from  matplotlib import pyplot as plt
+            img1 = self._moving_image.image.cpu().detach().numpy()[0, 0]
+            img2 = self._fixed_image.image.cpu().detach().numpy()[0, 0]
+            self.plt = plt.imshow(np.dstack((img1,img2,img1)))
+            plt.ion()
+            plt.show()
 
     def forward(self, displacement):
 
@@ -139,6 +147,13 @@ class MSE(_PairwiseImageLoss):
 
         # mask values
         value = th.masked_select(value, mask)
+        if self.debug:
+            mov = (self.warped_moving_image).cpu().detach().numpy()[0, 0]
+            fix = (self._fixed_image.image).cpu().detach().numpy()[0, 0]
+
+            self.plt.set_data(np.dstack((mov,fix,mov)))
+            plt.draw()
+            plt.pause(0.0001)
 
         return self.return_loss(value)
 
@@ -868,13 +883,680 @@ class NTG(_PairwiseImageLoss):
 
         metric = th.div(m, th.add(n1,n2))
         if self.debug:
+            #pdb.set_trace()
             img1 = (delta).cpu().detach().numpy()[0, 0]
             img2 = (i1x-i2x).cpu().detach().numpy()[0, 0]
             img3 = (i1y-i2y).cpu().detach().numpy()[0, 0]
-            mov = (self.warped_moving_image).cpu().detach().numpy()[0, 0]/255
-            fix = (self._fixed_image.image).cpu().detach().numpy()[0, 0]/255
+            mov = (self.warped_moving_image).cpu().detach().numpy()[0, 0]
+            fix = (self._fixed_image.image).cpu().detach().numpy()[0, 0]
 
             self.plt.set_data(np.dstack((mov,fix,mov)))
             plt.draw()
             plt.pause(0.0001)
         return metric
+
+class dNTG(_PairwiseImageLoss):
+    def __init__(self,
+                 fixed_image,
+                 moving_image,
+                 fixed_mask=None,
+                 moving_mask=None,
+                 size_average=True,
+                 reduce=True,
+                 debug=False):
+        super(dNTG, self).__init__(fixed_image, moving_image, fixed_mask, moving_mask, size_average, reduce)
+        self._name = "dNTG"
+        self.m = np.array([0])
+        self.debug = debug
+        # temp placeholder for warped images
+        self.warped_moving_image = None
+        if self.debug:
+            from  matplotlib import pyplot as plt
+            img1 = self._moving_image.image.cpu().detach().numpy()[0, 0]
+            img2 = self._fixed_image.image.cpu().detach().numpy()[0, 0]
+            self.plt = plt.imshow(np.dstack((img1,img2,img1)))
+            plt.ion()
+            plt.show()
+
+
+    def GetCurrentMask(self, displacement):
+        import skimage
+        """
+        Computes a mask defining if pixels are warped outside the image domain, or if they fall into
+        a fixed image mask or a warped moving image mask.
+        return (Tensor): maks array
+        """
+        # exclude points which are transformed outside the image domain
+
+        mask = get_mask(toNP(self._fixed_image.image)[0,0], toNP(self.warped_moving_image)[0,0])
+
+        mask2 = mask
+        for _ in range(3):
+            mask2 = skimage.morphology.binary_dilation(mask2)
+
+        mask2 = th.from_numpy(mask2)
+        mask2 = mask2[None,None,:,:]
+
+        mask = th.from_numpy(mask)
+        mask = mask[None,None,:,:]
+
+        return mask.to(self._device),mask2.to(self._device)
+
+
+
+    def forward(self, displacement):
+        from matplotlib import pyplot as plt
+        def weight(mat):
+            def old_weight(mat):
+                # flatten bincount
+                mat_ = (mat * 255).int()
+                w = th.bincount(mat_.view(-1), minlength=256)
+                c = th.cumsum(w,dim=0)
+                t = w.sum()
+                weight = (c-c[0]).float() / (t-c[0]).float()
+                weight_mat = weight[mat_.long()]
+                return weight_mat
+
+            def weight2(mat):
+                # flatten bincount
+                mat_ = (mat * 255).int()
+                w = th.bincount(mat_.int().view(-1), minlength=256)
+                max_bin = th.argmax(w)
+                c = th.cumsum(w,dim=0)
+                t = w[max_bin:].sum()
+                weight = (c-c[max_bin]).float() / (t-c[max_bin]).float()
+                weight[weight<0] = 0
+                weight_mat = weight[mat_.long()]
+
+                return weight_mat
+
+#            return weight2(mat)
+            return old_weight(mat)
+#                return block_low_grad(mat)
+
+
+        # compute displacement field
+        displacement = self._grid + displacement
+
+        # warp moving image with dispalcement field
+        self.warped_moving_image = F.grid_sample(self._moving_image.image, displacement)
+
+        # compute current mask
+        mask,mask2 = self.GetCurrentMask(displacement)
+
+
+#            moving_valid = th.masked_select(self.warped_moving_image, mask)
+#            fixed_valid = th.masked_select(self._fixed_image.image, mask)
+
+        dx = th.nn.Conv2d(in_channels=1,
+                          out_channels=1,
+                          kernel_size=(1,2),
+                          stride=1,
+                          padding=0,
+                          groups=1,
+                          bias=False)
+
+        kernelx = np.array([[[-1.0, 1.0]]])
+        kernelx = th.from_numpy(kernelx).view(1, 1, 1, 2)
+        dx.weight.data = kernelx.float().to(self._device)
+        dx.weight.requires_grad = True
+        dy = th.nn.Conv1d(in_channels=1,
+                          out_channels=1,
+                          kernel_size=(2,1),
+                          stride=1,
+                          padding=0,
+                          groups=1,
+                          bias=False)
+
+        kernely = np.array([[[-1.0],[1.0]]])
+        kernely = th.from_numpy(kernely).view(1, 1, 2, 1)
+        dy.weight.data = kernely.float().to(self._device)
+        dy.weight.requires_grad = True
+
+        mov = self.warped_moving_image.masked_fill(mask,0)
+        fix = self._fixed_image.image.masked_fill(mask,0)
+
+#        mov = (mov - mov.min()) / ((mov - mov.min()).max())
+#        fix = (fix - fix.min()) / ((fix - fix.min()).max())
+
+        i1x = th.abs(dx(mov))
+        i1y = th.abs(dy(mov))
+        i2x = th.abs(dx(fix))
+        i2y = th.abs(dy(fix))
+
+        xpad = th.nn.ZeroPad2d((0,1,0,0))
+        ypad = th.nn.ZeroPad2d((0,0,0,1))
+
+        i1x = xpad(i1x)
+        i2x = xpad(i2x)
+        i1y = ypad(i1y)
+        i2y = ypad(i2y)
+
+        i1x = i1x.masked_fill(mask2,0)
+        i1y = i1y.masked_fill(mask2,0)
+        i2x = i2x.masked_fill(mask2,0)
+        i2y = i2y.masked_fill(mask2,0)
+
+        delta = mov-fix
+
+        dx = th.abs(i1x - i2x)
+        dy = th.abs(i1y - i2y)
+
+        dx = dx.masked_fill(mask2,0)
+        dy = dy.masked_fill(mask2,0)
+
+
+        # add mask
+        m  = (dx+dy).sum()
+        n1 = (i1x+i1y).sum()
+        n2 = (i2x+i2y).sum()
+
+
+        metric = th.div(m, th.add(n1,n2))
+        if self.debug:
+            img1 = (delta).cpu().detach().numpy()[0, 0]
+            img2 = (i1x-i2x).cpu().detach().numpy()[0, 0]
+            img3 = (i1y-i2y).cpu().detach().numpy()[0, 0]
+            mov = (self.warped_moving_image).cpu().detach().numpy()[0, 0]
+            fix = (self._fixed_image.image).cpu().detach().numpy()[0, 0]
+
+            self.plt.set_data(np.dstack((mov,fix,mov)))
+            plt.draw()
+            plt.pause(0.0001)
+        return metric
+
+
+class MIND(th.nn.Module):
+
+    def __init__(self, device=th.device('cpu'), non_local_region_size =9, patch_size =7, neighbor_size =3, gaussian_patch_sigma =3.0):
+        super(MIND, self).__init__()
+        self.nl_size =non_local_region_size
+        self.p_size =patch_size
+        self.n_size =neighbor_size
+        self.sigma2 =gaussian_patch_sigma *gaussian_patch_sigma
+
+
+        # calc shifted images in non local region
+        self.image_shifter =th.nn.Conv2d(in_channels =1, out_channels =self.nl_size *self.nl_size,
+                                            kernel_size =(self.nl_size, self.nl_size),
+                                            stride=1, padding=((self.nl_size-1)//2, (self.nl_size-1)//2),
+                                            dilation=1, groups=1, bias=False, padding_mode='zeros')
+
+        for i in range(self.nl_size*self.nl_size):
+            t =th.zeros((1, self.nl_size, self.nl_size))
+            t[0, i%self.nl_size, i//self.nl_size] =1
+            self.image_shifter.weight.data[i] =t
+
+
+        # patch summation
+        self.summation_patcher =th.nn.Conv2d(in_channels =self.nl_size*self.nl_size, out_channels =self.nl_size*self.nl_size,
+                                              kernel_size =(self.p_size, self.p_size),
+                                              stride=1, padding=((self.p_size-1)//2, (self.p_size-1)//2),
+                                              dilation=1, groups=self.nl_size*self.nl_size, bias=False, padding_mode='zeros')
+
+        for i in range(self.nl_size*self.nl_size):
+            # gaussian kernel
+            t =th.zeros((1, self.p_size, self.p_size))
+            cx =(self.p_size-1)//2
+            cy =(self.p_size-1)//2
+            for j in range(self.p_size *self.p_size):
+                x=j%self.p_size
+                y=j//self.p_size
+                d2 =th.norm( th.tensor([x-cx, y-cy]).float(), 2)
+                t[0, x, y] =math.exp(-d2 / self.sigma2)
+
+            self.summation_patcher.weight.data[i] =t
+
+
+        # neighbor images
+        self.neighbors =th.nn.Conv2d(in_channels =1, out_channels =self.n_size*self.n_size,
+                                        kernel_size =(self.n_size, self.n_size),
+                                        stride=1, padding=((self.n_size-1)//2, (self.n_size-1)//2),
+                                        dilation=1, groups=1, bias=False, padding_mode='zeros')
+
+        for i in range(self.n_size*self.n_size):
+            t =th.zeros((1, self.n_size, self.n_size))
+            t[0, i%self.n_size, i//self.n_size] =1
+            self.neighbors.weight.data[i] =t
+
+
+        # neighbor patcher
+        self.neighbor_summation_patcher =th.nn.Conv2d(in_channels =self.n_size*self.n_size, out_channels =self.n_size*self.n_size,
+                                               kernel_size =(self.p_size, self.p_size),
+                                               stride=1, padding=((self.p_size-1)//2, (self.p_size-1)//2),
+                                               dilation=1, groups=self.n_size*self.n_size, bias=False, padding_mode='zeros')
+
+        for i in range(self.n_size*self.n_size):
+            t =th.ones((1, self.p_size, self.p_size))
+            self.neighbor_summation_patcher.weight.data[i] =t
+
+
+
+    def forward(self, orig, mask):
+
+        # get original image channel stack
+        orig_stack =th.stack([orig.squeeze(dim=1) for i in range(self.nl_size*self.nl_size)], dim=1)
+
+        # get shifted images
+        shifted =self.image_shifter(orig)
+
+        # get image diff
+        diff_images =shifted -orig_stack
+        # diff's L2 norm
+        Dx_alpha =self.summation_patcher(th.pow(diff_images, 2.0))
+        Dx_alpha = th.masked_fill(Dx_alpha, mask, 0)
+
+        # calc neighbor's variance
+        nbrs = self.neighbors(orig)
+
+        neighbor_images =self.neighbor_summation_patcher(nbrs)
+        neighbor_images = th.masked_fill(neighbor_images, mask.repeat(1,self.n_size**2,1,1)[:,:,:-1,:-1], 0)
+
+        Vx =neighbor_images.var(dim =1).unsqueeze(dim =1)
+#        Vx = th.masked_fill(Vx, mask, 0)
+
+        nume = th.exp(-Dx_alpha[:,:,:-1,:-1] / (Vx + 1e-8))
+        denomi = nume.sum(dim=1).unsqueeze(dim=1)
+        mind = nume / denomi
+        return mind
+
+
+
+
+class MINDLoss(_PairwiseImageLoss):
+    def __init__(self, fixed_image,
+                 moving_image,
+                 fixed_mask=None, moving_mask=None, size_average=True, reduce=True,
+                 non_local_region_size =3, patch_size =3, neighbor_size =3, gaussian_patch_sigma =1.0, debug=False):
+        super(MINDLoss, self).__init__(fixed_image, moving_image, fixed_mask, moving_mask, size_average, reduce)
+        self.nl_size =non_local_region_size
+        device = fixed_image.device
+        self._device = device
+
+        self._moving_mask = moving_mask.to(self._device)
+        self._fixed_mask = fixed_mask.to(self._device)
+        self.MIND =MINDV2(device=device,
+                        non_local_region_size =non_local_region_size,
+                        patch_size =patch_size,
+                        neighbor_size =neighbor_size,
+                        gaussian_patch_sigma =gaussian_patch_sigma)
+        with th.no_grad():
+            self.in_mind = self.MIND(fixed_image.image, self._fixed_mask)
+            self.tar_mind = self.MIND(moving_image.image, self._moving_mask)
+        self.debug=debug
+
+        if self.debug:
+            from  matplotlib import pyplot as plt
+            img1 = self._moving_image.image.cpu().detach().numpy()[0, 0]
+            img2 = self._fixed_image.image.cpu().detach().numpy()[0, 0]
+            self.plt = plt.imshow(np.dstack((img1,img2,img1)))
+            plt.ion()
+            plt.show()
+
+
+    def forward(self, displacement):
+        displacement = self._grid + displacement
+        # warp moving image with dispalcement field
+        with th.no_grad():
+            self._warped_moving_image = F.grid_sample(self._moving_image.image, displacement)
+            self._warped_moving_mask = F.grid_sample(self._moving_mask.to(th.float32), displacement, padding_mode='border').to(bool)
+
+        self.tar_mind = self.MIND(self._warped_moving_image, self._warped_moving_mask)
+        mind_moving = F.grid_sample(self.tar_mind, displacement)
+
+        # warp masks
+        mask = (self._warped_moving_mask | self._fixed_mask).to(self._device)
+        # get MIND descriptors
+#        mind_moving = self.MIND(self._warped_moving_image, self._warped_moving_mask)
+#        mind_fixed = self.MIND(self._fixed_image.image, self._fixed_mask)
+
+        mind_diff = mind_moving - self.in_mind
+        mind_diff = th.masked_fill(mind_diff, mask, 0)
+        l1 =th.norm( mind_diff, 1)
+
+        if self.debug:
+            self._warped_moving_image = F.grid_sample(self._moving_image.image, displacement)
+            mov = (self._warped_moving_image).cpu().detach().numpy()[0, 0]
+            fix = (self._fixed_image.image).cpu().detach().numpy()[0, 0]
+
+            self.plt.set_data(np.dstack((mov,fix,mov)))
+            plt.draw()
+            plt.pause(0.0001)
+        return l1/(self._fixed_image.image.shape[2] *self._fixed_image.image.shape[3] *self.nl_size *self.nl_size)
+
+
+
+
+
+class CrossCorrelation(_PairwiseImageLoss):
+    def __init__(self,
+                 fixed_image,
+                 moving_image,
+                 fixed_mask=None,
+                 moving_mask=None,
+                 size_average=True,
+                 reduce=True,
+                 debug=False):
+        super(CrossCorrelation, self).__init__(fixed_image, moving_image, fixed_mask, moving_mask, size_average, reduce)
+        self._name = "ccloss"
+
+
+    def forward(self, displacement):
+
+        self._warped_moving_image = self._moving_image.image
+        mov = self._moving_image.image
+        fix = self._fixed_image.image
+
+        convCC = th.nn.Conv2d(in_channels=1,
+                          out_channels=1,
+                          kernel_size=mov.size(),
+                          stride=1,
+                          bias=False)
+        convCC.weight.data = mov
+        pad = th.nn.ZeroPad2d((0,0,0,10))
+        fix = pad(fix)
+        cc = convCC(fix)
+        return cc[0,0]
+        a = toNP(fix[0, 0])
+        b = toNP(mov[0, 0])
+        m = np.zeros(a.shape)
+        cc = toNP(cc[0, 0])
+        j, i = np.unravel_index(np.argmax(cc), cc.shape)
+        h, w = b.shape
+        m[j:j + h, i:i + w] = b
+        plt.imshow(np.dstack((a * 10, m * 10, a * 10)))
+        plt.show()
+
+
+
+        pos = th.argmax(cc)
+        val = th.max(cc)
+        s = th.tensor(cc.size())
+        return th.tensor((val,pos,s[2],s[3]))#pad[0], pad[1]))
+
+
+class SSC(th.nn.Module):
+
+    def __init__(self, device=th.device('cpu'), non_local_region_size =3 , patch_size =3, neighbor_size =3, gaussian_patch_sigma =2.0):
+        super(SSC, self).__init__()
+        self.nl_size =non_local_region_size
+        self.p_size =patch_size
+        self.n_size =neighbor_size
+        self.sigma2 =gaussian_patch_sigma * gaussian_patch_sigma
+        self.device = device
+        self.nbr = 4
+
+        # calc shifted images in non local region
+        self.image_shifter = th.nn.Conv2d(in_channels =1, out_channels = self.nbr,
+                                            kernel_size =(self.p_size, self.p_size),
+                                            stride=1, padding=((self.p_size-1)//2, (self.p_size-1)//2),
+                                            dilation=1, groups=1, bias=False, padding_mode='zeros').to(device)
+        idx = [[0,1],[1,0],[2,1],[1,2]]
+        for i in range(self.nbr):
+            t = th.zeros((1, self.p_size, self.p_size))
+            t[0,idx[i][0], idx[i][1] ] = 1
+            self.image_shifter.weight.data[i] = t
+
+
+        # patch summation with gaussian weighting
+        self.summation_patcher =th.nn.Conv2d(in_channels = self.nl_size,
+                                             out_channels = self.nl_size,
+                                              kernel_size =(self.p_size, self.p_size),
+                                              stride=1, padding=((self.p_size-1)//2, (self.p_size-1)//2),
+                                              dilation=1, groups=self.nl_size, bias=False, padding_mode='zeros').to(device)
+
+        for i in range(self.nbr):
+            # gaussian kernel
+            t =th.zeros((1, self.p_size, self.p_size))
+            cx =(self.p_size-1)//2
+            cy =(self.p_size-1)//2
+            for j in range(self.p_size *self.p_size):
+                x=j%self.p_size
+                y=j//self.p_size
+                d2 =th.norm( th.tensor([x-cx, y-cy]).float(), 2)
+                t[0, x, y] =math.exp(-d2 / self.sigma2)
+
+            self.summation_patcher.weight.data[i] =t
+
+
+        # neighbor images
+        self.neighbors =th.nn.Conv2d(in_channels =1, out_channels = 4,
+                                        kernel_size =(self.n_size, self.n_size),
+                                        stride=1, padding=((self.n_size-1)//2, (self.n_size-1)//2),
+                                        dilation=1, groups=1, bias=False, padding_mode='zeros').to(device)
+        idx = [[0,1],[1,0],[2,1],[1,2]]
+        for i in range(self.nbr):
+            t = th.zeros((1, self.p_size, self.p_size))
+            t[0,idx[i][0], idx[i][1] ] = 1
+            self.neighbors.weight.data[i] = t
+
+
+        # neighbor patcher for calculating noise estimate
+        self.neighbor_summation_patcher =th.nn.Conv2d(in_channels =self.nbr, out_channels =self.nbr,
+                                               kernel_size =(self.p_size, self.p_size),
+                                               stride=1, padding=((self.p_size-1)//2, (self.p_size-1)//2),
+                                               dilation=1, groups=4, bias=False, padding_mode='zeros').to(device)
+
+        for i in range(self.nbr):
+            t =th.ones((1, self.p_size, self.p_size))
+            self.neighbor_summation_patcher.weight.data[i] =t
+
+    def forward(self, orig, mask):
+
+        # get original image channel stack
+        orig_stack =th.stack([orig.squeeze(dim=1) for i in range(self.nl_size*self.nl_size)], dim=1)
+        mask_stack =th.stack([mask.squeeze(dim=1) for i in range(self.nbr)], dim=1)
+
+        # get shifted images
+        shifted =self.image_shifter(orig)
+
+        # for SSD we have to roll the shifted images to get the 4/6 neighbourhood diffs on the channel dimension
+        shifted_roll = th.roll(shifted,1,dims=1)
+
+        # get image diff
+        diff_images =shifted - shifted_roll
+        # diff's L2 norm
+        diff_images = th.masked_fill(diff_images, mask, 0)
+
+        SSD =self.summation_patcher(th.pow(diff_images, 2.0))
+        Var = th.mean(SSD, dim=1,keepdim=True)
+#        # calc neighbor's variance
+#        nbrs = self.neighbors(orig)
+#
+#        neighbor_images =self.neighbor_summation_patcher(nbrs)
+#        Vx =neighbor_images.var(dim =1).unsqueeze(dim =1)
+
+        # output S
+        S =th.exp(-SSD /(Var+1e-8))
+
+        #normalize to that max(S) = 1
+        norm = th.max(S)
+        SSC = S/norm
+
+        return SSC
+
+class SSCLoss(_PairwiseImageLoss):
+    def __init__(self, fixed_image,
+                 moving_image,
+                 fixed_mask=None, moving_mask=None, size_average=True, reduce=True,
+                 non_local_region_size = 4, patch_size = 3, neighbor_size = 3, gaussian_patch_sigma =0.5, debug=False):
+        super(SSCLoss, self).__init__(fixed_image, moving_image, fixed_mask, moving_mask, size_average, reduce)
+        self.nl_size =non_local_region_size
+        device = fixed_image.device
+        self._device = device
+
+        self._moving_mask = moving_mask
+        self._fixed_mask = fixed_mask
+        self.SSC =SSC(device=device,
+                        non_local_region_size =non_local_region_size,
+                        patch_size =patch_size,
+                        neighbor_size =neighbor_size,
+                        gaussian_patch_sigma =gaussian_patch_sigma)
+
+        self.in_mind = fixed_image.image
+        self.tar_mind = moving_image.image
+        self.debug=debug
+
+        if self.debug:
+            from  matplotlib import pyplot as plt
+            img1 = self._moving_image.image.cpu().detach().numpy()[0, 0]
+            img2 = self._fixed_image.image.cpu().detach().numpy()[0, 0]
+            self.plt = plt.imshow(np.dstack((img1,img2,img1)))
+            plt.ion()
+            plt.show()
+
+
+    def forward(self, displacement):
+        displacement = self._grid + displacement
+        # warp moving image with dispalcement field
+        self._warped_moving_image = F.grid_sample(self._moving_image.image, displacement)
+
+        # warp masks
+        self._warped_moving_mask = F.grid_sample(self._moving_mask.to(th.float32), displacement, padding_mode='border').to(bool)
+        mask = (self._warped_moving_mask | self._fixed_mask).to(self._device)
+        # get SSC descriptors
+        SSC_moving = self.SSC(self._warped_moving_image, self._warped_moving_mask)
+        SSC_fixed = self.SSC(self._fixed_image.image, self._fixed_mask)
+
+        SSC_diff = (SSC_moving - SSC_fixed)
+        SSC_diff = th.masked_fill(SSC_diff, mask, 0)
+        l1 =th.norm( SSC_diff, 1)
+
+
+        if self.debug:
+            mov = (self._warped_moving_image).cpu().detach().numpy()[0, 0]
+            fix = (self._fixed_image.image).cpu().detach().numpy()[0, 0]
+
+            self.plt.set_data(np.dstack((mov,fix,mov)))
+            plt.draw()
+            plt.pause(0.0001)
+        return l1/(self._fixed_image.image.shape[2] *self._fixed_image.image.shape[3] *self.nl_size *self.nl_size)
+
+
+
+
+
+class MINDV2(th.nn.Module):
+
+    def __init__(self, device=th.device('cpu'),
+                 non_local_region_size =3,
+                 patch_size =3,
+                 neighbor_size =3,
+                 gaussian_patch_sigma =1.0):
+
+        super(MINDV2, self).__init__()
+        self.nl_size =non_local_region_size
+        self.p_size =patch_size
+        self.n_size =neighbor_size
+        self.sigma2 =gaussian_patch_sigma *gaussian_patch_sigma
+        self.device = device
+        self.nbr = 4
+
+
+        # calc shifted images in non local region
+        self.image_shifter = th.nn.Conv2d(in_channels =1, out_channels = 8,
+                                            kernel_size =(self.p_size, self.p_size),
+                                            stride=1, padding=((self.p_size-1)//2, (self.p_size-1)//2),
+                                            dilation=1, groups=1, bias=False, padding_mode='zeros').to(device)
+        idx = [[0,0],[0,1],[0,2],
+               [1,0],[1,2],
+               [2,0],[2,1],[2,2]]
+        for i in range(8):
+            t = th.zeros((1, self.p_size, self.p_size))
+            t[0,idx[i][0], idx[i][1] ] = 1
+            self.image_shifter.weight.data[i] = t
+
+        # patch summation
+        self.summation_patcher =th.nn.Conv2d(in_channels = 8,
+                                             out_channels = 8,
+                                              kernel_size =(self.p_size, self.p_size),
+                                              stride=1, padding=((self.p_size-1)//2, (self.p_size-1)//2),
+                                              dilation=1, groups=8, bias=False, padding_mode='zeros').to(device)
+        t =th.zeros((1, self.p_size, self.p_size))
+        cx =(self.p_size-1)//2
+        cy =(self.p_size-1)//2
+        for j in range(self.p_size *self.p_size):
+            x=j%self.p_size
+            y=j//self.p_size
+            d2 =th.norm( th.tensor([x-cx, y-cy]).float(), 2)
+            t[0, x, y] =math.exp(-d2 / self.sigma2)
+
+        for i in range(8):
+            # gaussian kernel
+            self.summation_patcher.weight.data[i] = t
+
+
+        self.neighbors =th.nn.Conv2d(in_channels =1, out_channels = 4,
+                                        kernel_size =(self.n_size, self.n_size),
+                                        stride=1, padding=((self.n_size-1)//2, (self.n_size-1)//2),
+                                        dilation=1, groups=1, bias=False, padding_mode='zeros').to(device)
+        idx = [[0,1],[1,0],[2,1],[1,2]]
+        for i in range(self.nbr):
+            t = th.zeros((1, self.p_size, self.p_size))
+            t[0,idx[i][0], idx[i][1] ] = 1
+            self.neighbors.weight.data[i] = t
+
+
+        # neighbor patcher for calculating noise estimate
+        self.neighbor_summation_patcher =th.nn.Conv2d(in_channels =self.nbr,
+                                                out_channels =self.nbr,
+                                               kernel_size =(self.p_size, self.p_size),
+                                               stride=1, padding=((self.p_size-1)//2, (self.p_size-1)//2),
+                                               dilation=1, groups=self.nbr, bias=False, padding_mode='zeros').to(device)
+        t =th.zeros((1, self.p_size, self.p_size))
+        cx =(self.p_size-1)//2
+        cy =(self.p_size-1)//2
+        for j in range(self.p_size *self.p_size):
+            x=j%self.p_size
+            y=j//self.p_size
+            d2 =th.norm( th.tensor([x-cx, y-cy]).float(), 2)
+            t[0, x, y] =math.exp(-d2 / self.sigma2)
+        for i in range(self.nbr):
+            self.neighbor_summation_patcher.weight.data[i] =t
+
+        self.image_shifter_origin = th.nn.Conv2d(in_channels =1, out_channels = 1,
+                                        kernel_size =(self.n_size, self.n_size),
+                                        stride=1, padding=((self.n_size-1)//2, (self.n_size-1)//2),
+                                        dilation=1, groups=1, bias=False, padding_mode='zeros').to(device)
+        idx = [[1,1]]
+        for i in range(1):
+            t = th.zeros((1, self.p_size, self.p_size))
+            t[0,idx[i][0], idx[i][1] ] = 1
+        self.image_shifter_origin.weight.data[0] = t
+
+
+    def forward(self, orig, mask):
+        orig_shifted = self.image_shifter_origin(orig)
+        # get original image channel stack
+        orig_stack =th.stack([orig_shifted.squeeze(dim=1) for i in range(8)], dim=1)
+
+        # get shifted images
+        shifted =self.image_shifter(orig)
+
+        # get image diff
+        diff_images =shifted -orig_stack
+        # diff's L2 norm
+        Dx_alpha =self.summation_patcher(th.pow(diff_images, 2.0))
+        Dx_alpha = th.masked_fill(Dx_alpha, mask, 0)
+
+        # calc neighbor's variance
+        nbrs = self.neighbors(orig)
+
+        nbrs_stack =th.stack([orig_shifted.squeeze(dim=1) for i in range(4)], dim=1)
+
+        nbrs = th.pow(nbrs - nbrs_stack,2.0)
+        ''' gaussian weight '''
+        neighbor_images =self.neighbor_summation_patcher(nbrs)
+        neighbor_images = th.masked_fill(neighbor_images, mask, 0)
+        Vx = th.mean(neighbor_images, dim=1)[0]
+        val0 = 0.001 * (th.mean(th.masked_select(Vx,~mask[0,0])))
+        val1 = 1000. * th.mean(th.masked_select(Vx,~mask[0,0]))
+
+        Vx = th.min(th.max(Vx, val0), val1)
+#        Vx =neighbor_images.var(dim =1).unsqueeze(dim =1)
+
+
+        nume = th.exp(-Dx_alpha / (Vx + 1e-12))
+        denomi = nume.sum(dim=1).unsqueeze(dim=1)
+        mind = nume / (denomi+1e-12)
+        return mind

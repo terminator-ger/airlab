@@ -87,7 +87,7 @@ class _ImageSeriesRegistration(_Registration):
 
 
 class PairwiseRegistration(_PairwiseRegistration):
-    def __init__(self, verbose=True):
+    def __init__(self, verbose=False):
         super(PairwiseRegistration, self).__init__(verbose=verbose)
 
     def _closure(self):
