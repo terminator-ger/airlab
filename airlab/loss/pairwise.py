@@ -14,15 +14,394 @@
 
 import torch as th
 import torch.nn.functional as F
-
+from Image import toByteImage
 import numpy as np
 import matplotlib.pyplot as plt
 
 from .. import transformation as T
+import torch.nn as nn
+import torchvision as tv
 from ..transformation import utils as tu
 from ..utils import kernelFunction as utils
-from ..utils.image import toNP, get_mask
+from ..utils.image import get_masks_for_image_series, toNP, get_mask, ImageSeries
 import pdb
+import math
+
+
+class DMR(th.nn.Module):
+    def __init__(self):
+        super(DMR, self).__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(2, 32, 5, 2),
+            nn.ReLU(True),
+            nn.Conv2d(32, 32, 3, 2),
+            nn.BatchNorm2d(32),
+            nn.ReLU(True),
+            nn.Conv2d(32, 128, 3, 2),
+            nn.ReLU(True),
+            nn.Conv2d(128, 128, 3, 2),
+            nn.BatchNorm2d(128),
+            nn.ReLU(True),
+        )
+        self.pool = nn.AvgPool2d(6,6)
+        self.fc0 = nn.Linear(128, 512)
+        self.do = nn.Dropout()
+        self.fc1 = nn.Linear(512,1)
+        
+        #self.net = torchvision.models.resnet18(pretrained=True)
+        #self.net.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3,bias=False)
+        #self.net.fc = nn.Linear(512, 1)
+ 
+       
+       
+    def forward(self, x):
+        # transform the input
+        x = self.net(x)         # [B, 128, 6, 6]
+        x = self.pool(x)        # [B, 128, 1, 1]
+        x = self.fc0(x.squeeze())
+        x = self.do(x)
+        x = self.fc1(x)
+        return x
+
+class _SequencewiseImageLoss(th.nn.modules.Module):
+    def __init__(self, 
+                fixed_images: ImageSeries, 
+                moving_images: ImageSeries, 
+                fixed_mask=None, 
+                moving_mask=None, 
+                size_average=True, 
+                weights=None,
+                reduce=True):
+        super(_SequencewiseImageLoss, self).__init__()
+        self._size_average = size_average
+        self._reduce = reduce
+        self._name = "parent"
+
+        self._warped_moving_image = None
+        self._warped_moving_mask = None
+        if weights is None:
+            self._weight = 1
+        else:
+            self._weight = th.tensor(weights)
+
+        self._moving_images = moving_images
+        self._moving_masks = moving_mask
+        self._fixed_images = fixed_images
+        self._fixed_mask = fixed_mask
+        self._grid = None
+        assert self._moving_images != None and self._fixed_images != None
+        # TODO allow different image size for each image in the future
+
+        self._grid = T.utils.compute_grid_batch(self._moving_images.size, 
+                                                dtype=self._moving_images.dtype,
+                                                device=self._moving_images.device)
+
+        self._dtype = self._moving_images.dtype
+        self._device = self._moving_images.device
+
+    @property
+    def name(self):
+        return self._name
+
+    # conditional return
+    def return_loss(self, tensor):
+        if self._size_average and self._reduce:
+            return (tensor*self._weight.to(tensor.device)).mean()
+        if not self._size_average and self._reduce:
+            return tensor.sum()*self._weight.to(tensor.device)
+        if not self.reduce:
+            return tensor*self._weight.to(tensor.device)
+
+
+class Series_DMR(_SequencewiseImageLoss):
+    def __init__(self,
+                 fixed_images,
+                 moving_images,
+                 fixed_mask=None,
+                 moving_mask=None,
+                 size_average=True,
+                 reduce=True,
+                 debug=False,
+                 weights=None):
+        super(Series_DMR, self).__init__(fixed_images, 
+                                   moving_images, 
+                                   fixed_mask, 
+                                   moving_mask, 
+                                   size_average,
+                                   weights, 
+                                   reduce)  
+        self._name = "DMR"
+        self.m = np.array([0])
+        self.iteration = 0
+        self.debug = debug
+        self._name = "dmr"
+        self.net = DMR()
+        ckpt = th.load('/home/lechnerml/sw/ImageRegistration/GlobalSearch/dmr-epoch=99-val_loss=0.10.ckpt')
+        new_dict = {}
+        for k,v in ckpt['state_dict'].items():
+            new_dict[k.removeprefix('net.')] = v
+
+
+        self.net.load_state_dict(new_dict)
+        self.net.eval()
+        self.net.to(self._moving_images.device)
+
+
+        # temp placeholder for warped images
+        self.warped_moving_images = None
+        self.cnt = 0
+        if self.debug:
+            IMG = self._moving_images.images
+            for i in range(len(IMG)):
+                ax = plt.subplot((len(IMG)+3)//4, 4, i+1)
+                mov = (self._moving_images.images).cpu().detach().numpy()[i, 0]
+                fix = (self._fixed_images.images).cpu().detach().numpy()[i, 0]
+
+                ax.imshow(np.dstack((mov,fix,mov)))
+
+    def GetCurrentMask(self, displacement):
+        import skimage
+        """
+        Computes a mask defining if pixels are warped outside the image domain, or if they fall into
+        a fixed image mask or a warped moving image mask.
+        return (Tensor): maks array
+        """
+        # exclude points which are transformed outside the image domain
+
+        mask = get_masks_for_image_series(toNP(self._fixed_images.images), 
+                                          toNP(self.warped_moving_images))
+
+        mask_fixed = toNP(self._fixed_mask.images/255).astype(bool)
+        mask = np.logical_or(mask, mask_fixed)
+        mask2 = mask
+        for _ in range(3):
+            mask2 = skimage.morphology.binary_dilation(mask2)
+
+        mask2 = th.from_numpy(mask2)
+        mask = th.from_numpy(mask)
+
+        return mask.to(self._device),mask2.to(self._device)
+
+
+
+    def forward(self, displacements):
+        from matplotlib import pyplot as plt
+        # compute displacement field
+        # add displacemnets
+        displacements = th.stack(displacements)
+        displacements = self._grid + displacements
+
+        # warp moving image with dispalcement field
+        self.warped_moving_images = F.grid_sample(self._moving_images.images, 
+                                                  displacements, 
+                                                  align_corners=False)
+
+        # compute current mask
+        mask,mask2 = self.GetCurrentMask(displacements)
+        mov = self.warped_moving_images.masked_fill(mask,0)
+        fix = self._fixed_images.images.masked_fill(mask,0)
+
+        img_stack = th.cat((fix, mov), 1)
+        # resample to w, h 128
+
+        img_stack = tv.transforms.Resize(128)(img_stack)
+        img_stack = tv.transforms.CenterCrop((128,128))(img_stack)
+        loss = self.net(img_stack)
+
+        if self.debug:
+            frames = []
+            for i in range(len(img_stack)):
+            
+                #ax = plt.subplot((len(img_stack)+3)//4, 4, i+1)
+                if self.iteration % 5 == 0:
+                    ax = plt.subplot(111)
+                    mov = (img_stack).cpu().detach().numpy()[i, 0]
+                    fix = (img_stack).cpu().detach().numpy()[i, 1]
+                    m = toNP(mask)[i,0]
+                    frames.append(np.dstack((mov,fix,mov)))
+                    ax.imshow(frames[i])
+                    plt.savefig('{}.png'.format(self.cnt), dpi=400)
+            
+            self.cnt += 1
+        self.iteration += 1
+        return loss
+
+
+
+class Series_dNTG(_SequencewiseImageLoss):
+    def __init__(self,
+                 fixed_images,
+                 moving_images,
+                 fixed_mask=None,
+                 moving_mask=None,
+                 size_average=True,
+                 reduce=True,
+                 debug=False,
+                 weights=None):
+        super(Series_dNTG, self).__init__(fixed_images, 
+                                   moving_images, 
+                                   fixed_mask, 
+                                   moving_mask, 
+                                   size_average,
+                                   weights, 
+                                   reduce)
+        self._name = "dNTG"
+        self.m = np.array([0])
+        self.iteration = 0
+        self.debug = debug
+        # temp placeholder for warped images
+        self.warped_moving_images = None
+        self.cnt = 0
+        if self.debug:
+            IMG = self._moving_images.images
+            for i in range(len(IMG)):
+                ax = plt.subplot((len(IMG)+3)//4, 4, i+1)
+                mov = (self._moving_images.images).cpu().detach().numpy()[i, 0]
+                fix = (self._fixed_images.images).cpu().detach().numpy()[i, 0]
+
+                ax.imshow(np.dstack((mov,fix,mov)))
+    
+
+
+    def GetCurrentMask(self, displacement):
+        import skimage
+        """
+        Computes a mask defining if pixels are warped outside the image domain, or if they fall into
+        a fixed image mask or a warped moving image mask.
+        return (Tensor): maks array
+        """
+        # exclude points which are transformed outside the image domain
+
+        mask = get_masks_for_image_series(toNP(self._fixed_images.images), 
+                                          toNP(self.warped_moving_images))
+
+        mask_fixed = toNP(self._fixed_mask.images/255).astype(bool)
+        mask = np.logical_or(mask, mask_fixed)
+        mask2 = mask
+        for _ in range(3):
+            mask2 = skimage.morphology.binary_dilation(mask2)
+
+        mask2 = th.from_numpy(mask2)
+        mask = th.from_numpy(mask)
+
+        return mask.to(self._device),mask2.to(self._device)
+
+
+
+    def forward(self, displacements):
+        from matplotlib import pyplot as plt
+        # compute displacement field
+        # add displacemnets
+        displacements = th.stack(displacements)
+        displacements = self._grid + displacements
+
+        # warp moving image with dispalcement field
+        self.warped_moving_images = F.grid_sample(self._moving_images.images, 
+                                                  displacements, 
+                                                  align_corners=False)
+
+
+        # compute current mask
+        mask,mask2 = self.GetCurrentMask(displacements)
+
+        dx = th.nn.Conv2d(in_channels=1,
+                          out_channels=1,
+                          kernel_size=(1,2),
+                          stride=1,
+                          padding=0,
+                          groups=1,
+                          bias=False)
+
+        kernelx = np.array([[[-1.0, 1.0]]])
+        kernelx = th.from_numpy(kernelx).view(1, 1, 1, 2)
+        dx.weight.data = kernelx.float().to(self._device)
+        dx.weight.requires_grad = True
+        dy = th.nn.Conv1d(in_channels=1,
+                          out_channels=1,
+                          kernel_size=(2,1),
+                          stride=1,
+                          padding=0,
+                          groups=1,
+                          bias=False)
+
+        kernely = np.array([[[-1.0],[1.0]]])
+        kernely = th.from_numpy(kernely).view(1, 1, 2, 1)
+        dy.weight.data = kernely.float().to(self._device)
+        dy.weight.requires_grad = True
+
+        mov = self.warped_moving_images.masked_fill(mask,0)
+        fix = self._fixed_images.images.masked_fill(mask,0)
+        
+        i1x = th.abs(dx(mov))
+        i1y = th.abs(dy(mov))
+        i2x = th.abs(dx(fix))
+        i2y = th.abs(dy(fix))
+
+        xpad = th.nn.ZeroPad2d((0,1,0,0))
+        ypad = th.nn.ZeroPad2d((0,0,0,1))
+
+        i1x = xpad(i1x)
+        i2x = xpad(i2x)
+        i1y = ypad(i1y)
+        i2y = ypad(i2y)
+
+        i1x = i1x.masked_fill(mask2,0)
+        i1y = i1y.masked_fill(mask2,0)
+        i2x = i2x.masked_fill(mask2,0)
+        i2y = i2y.masked_fill(mask2,0)
+
+        delta = mov-fix
+
+        dx = th.abs(i1x - i2x)
+        dy = th.abs(i1y - i2y)
+
+        dx = dx.masked_fill(mask2,0)
+        dy = dy.masked_fill(mask2,0)
+
+        # add mask
+        m  = th.sum(dx+dy  ,(1,2,3))
+        n1 = th.sum(i1x+i1y,(1,2,3))
+        n2 = th.sum(i2x+i2y,(1,2,3))
+        metric = th.div(m, th.add(n1,n2))
+        metric[th.isnan(metric)] = 0
+        metric = self.return_loss(metric)
+
+        if self.debug:
+            frames = []
+            for i in range(len(self.warped_moving_images)):
+                ax = plt.subplot((len(self.warped_moving_images)+3)//4, 4, i+1)
+                mov = (self.warped_moving_images).cpu().detach().numpy()[i, 0]
+                fix = (self._fixed_images.images).cpu().detach().numpy()[i, 0]
+                m = toNP(mask)[i,0]
+                frames.append(np.dstack((mov,fix,mov)))
+                ax.imshow(frames[i])            
+            plt.savefig('{}.png'.format(self.cnt), dpi=400)
+
+            self.cnt += 1
+
+        print(self.iteration)
+
+            #if self.iteration % 10 == 0:
+            #    import cv2
+            #    import os
+
+            #    image_folder = 'tmp'
+            #    video_name = 'video_{}.avi'.format(self.iteration)
+            #    height, width, c = frames[0].shape
+
+            #    video = cv2.VideoWriter(video_name, 0, 1, (width,height))
+
+            #    for image in frames:
+            #        video.write(toByteImage(image))
+
+            #    cv2.destroyAllWindows()
+            #    video.release()
+
+        self.iteration += 1
+        return metric
+
+
+
 
 
 # Loss base class (standard from PyTorch)
@@ -35,7 +414,6 @@ class _PairwiseImageLoss(th.nn.modules.Module):
 
         self._warped_moving_image = None
         self._warped_moving_mask = None
-        self._weight = 1
 
         self._moving_image = moving_image
         self._moving_mask = moving_mask
@@ -54,6 +432,7 @@ class _PairwiseImageLoss(th.nn.modules.Module):
 
         self._dtype = self._moving_image.dtype
         self._device = self._moving_image.device
+        self._weight = th.tensor([1]).to(self._device)
 
     @property
     def name(self):
@@ -77,7 +456,7 @@ class _PairwiseImageLoss(th.nn.modules.Module):
 
         # and exclude points which are masked by the warped moving and the fixed mask
         if not self._moving_mask is None:
-            self._warped_moving_mask = F.grid_sample(self._moving_mask.image, displacement)
+            self._warped_moving_mask = F.grid_sample(self._moving_mask.image, displacement, align_corners=False)
             self._warped_moving_mask = self._warped_moving_mask >= 0.5
 
             # if either the warped moving mask or the fixed mask is zero take zero,
@@ -353,7 +732,7 @@ class MI(_PairwiseImageLoss):
         return self._bins_fixed_image
 
     def _compute_marginal_entropy(self, values, bins):
-
+        pdb.set_trace()
         p = th.exp(-((values - bins).pow(2).div(self._sigma))).div(self._normalizer_1d)
         p_n = p.mean(dim=1)
         p_n = p_n/(th.sum(p_n) + 1e-10)
@@ -398,7 +777,9 @@ class MI(_PairwiseImageLoss):
         p_joint = p_joint / (th.sum(p_joint) + 1e-10)
 
         ent_joint = -(p_joint * th.log2(p_joint + 1e-10)).sum()
-
+        print(ent_fixed_image)
+        print(ent_moving_image)
+        print(ent_joint)
         return -(ent_fixed_image + ent_moving_image - ent_joint)
 
 class NGF(_PairwiseImageLoss):
@@ -489,7 +870,6 @@ class NGF(_PairwiseImageLoss):
             value = value + ng_warped_image[:, dim, ...] * self._ng_fixed_image[:, dim, ...]
 
         value = 0.5 * th.masked_select(-value.pow(2), mask)
-
         return self.return_loss(value)
 
 
@@ -908,6 +1288,7 @@ class dNTG(_PairwiseImageLoss):
         self._name = "dNTG"
         self.m = np.array([0])
         self.debug = debug
+        self.cnt = 0
         # temp placeholder for warped images
         self.warped_moving_image = None
         if self.debug:
@@ -970,9 +1351,7 @@ class dNTG(_PairwiseImageLoss):
 
                 return weight_mat
 
-#            return weight2(mat)
             return old_weight(mat)
-#                return block_low_grad(mat)
 
 
         # compute displacement field
@@ -983,10 +1362,6 @@ class dNTG(_PairwiseImageLoss):
 
         # compute current mask
         mask,mask2 = self.GetCurrentMask(displacement)
-
-
-#            moving_valid = th.masked_select(self.warped_moving_image, mask)
-#            fixed_valid = th.masked_select(self._fixed_image.image, mask)
 
         dx = th.nn.Conv2d(in_channels=1,
                           out_channels=1,
@@ -1015,9 +1390,6 @@ class dNTG(_PairwiseImageLoss):
 
         mov = self.warped_moving_image.masked_fill(mask,0)
         fix = self._fixed_image.image.masked_fill(mask,0)
-
-#        mov = (mov - mov.min()) / ((mov - mov.min()).max())
-#        fix = (fix - fix.min()) / ((fix - fix.min()).max())
 
         i1x = th.abs(dx(mov))
         i1y = th.abs(dy(mov))
@@ -1061,8 +1433,12 @@ class dNTG(_PairwiseImageLoss):
             fix = (self._fixed_image.image).cpu().detach().numpy()[0, 0]
 
             self.plt.set_data(np.dstack((mov,fix,mov)))
-            plt.draw()
-            plt.pause(0.0001)
+            #plt.draw()
+            #plt.pause(0.0001)
+            if self.cnt % 5 == 0:
+                plt.savefig('{}.png'.format(self.cnt), dpi=400)
+
+            self.cnt += 1
         return metric
 
 
@@ -1153,13 +1529,11 @@ class MIND(th.nn.Module):
         neighbor_images = th.masked_fill(neighbor_images, mask.repeat(1,self.n_size**2,1,1)[:,:,:-1,:-1], 0)
 
         Vx =neighbor_images.var(dim =1).unsqueeze(dim =1)
-#        Vx = th.masked_fill(Vx, mask, 0)
 
         nume = th.exp(-Dx_alpha[:,:,:-1,:-1] / (Vx + 1e-8))
         denomi = nume.sum(dim=1).unsqueeze(dim=1)
         mind = nume / denomi
         return mind
-
 
 
 
@@ -1207,8 +1581,6 @@ class MINDLoss(_PairwiseImageLoss):
         # warp masks
         mask = (self._warped_moving_mask | self._fixed_mask).to(self._device)
         # get MIND descriptors
-#        mind_moving = self.MIND(self._warped_moving_image, self._warped_moving_mask)
-#        mind_fixed = self.MIND(self._fixed_image.image, self._fixed_mask)
 
         mind_diff = mind_moving - self.in_mind
         mind_diff = th.masked_fill(mind_diff, mask, 0)
@@ -1223,6 +1595,40 @@ class MINDLoss(_PairwiseImageLoss):
             plt.draw()
             plt.pause(0.0001)
         return l1/(self._fixed_image.image.shape[2] *self._fixed_image.image.shape[3] *self.nl_size *self.nl_size)
+
+
+class DMRLoss(_PairwiseImageLoss):
+    def __init__(self,
+                 fixed_image,
+                 moving_image,
+                 fixed_mask=None,
+                 moving_mask=None,
+                 size_average=True,
+                 reduce=True,
+                 debug=False):
+        super(DMR, self).__init__(fixed_image, moving_image, fixed_mask, moving_mask, size_average, reduce)
+        self._name = "dmr"
+        self.net = DMR()
+        self.net.load_from_checkpoint('best_dmr.ckpt')
+        self.net.eval()
+
+    def forward(self, displacement):
+        # compute displacement field
+        displacement = self._grid + displacement
+
+        # warp moving image with dispalcement field
+        self.warped_moving_image = F.grid_sample(self._moving_image.image, displacement)
+
+        # compute current mask
+        mask,mask2 = self.GetCurrentMask(displacement)
+        mov = self.warped_moving_image.masked_fill(mask,0)
+        fix = self._fixed_image.image.masked_fill(mask,0)
+
+        img_stack = th.stack((fix, mov), 0)
+        # resample to w, h 128
+        img_stack = tv.transforms.Resize(128)(img_stack)
+        loss = self.DMR(img_stack)
+        return loss
 
 
 
@@ -1385,8 +1791,8 @@ class SSCLoss(_PairwiseImageLoss):
         device = fixed_image.device
         self._device = device
 
-        self._moving_mask = moving_mask
-        self._fixed_mask = fixed_mask
+        self._moving_mask = moving_mask.to(self._device)
+        self._fixed_mask = fixed_mask.to(self._device)
         self.SSC =SSC(device=device,
                         non_local_region_size =non_local_region_size,
                         patch_size =patch_size,

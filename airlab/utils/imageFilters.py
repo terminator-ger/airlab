@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
 import os
 import multiprocessing as mp
 os.environ["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"] = str(mp.cpu_count())
@@ -20,8 +21,8 @@ import SimpleITK as sitk
 import numpy as np
 import torch as th
 
-from .image import Image
-
+from .image import Image, ImageSeries
+import pdb
 
 def auto_crop_image_filter(image, boundary_value=0):
     """
@@ -55,6 +56,24 @@ def auto_crop_image_filter(image, boundary_value=0):
     cropped.unsqueeze_(0).unsqueeze_(0)
 
     return Image(cropped, size, image.spacing, origin.tolist())
+
+def normalize_image_series(fixed: ImageSeries, moving:ImageSeries) -> Tuple[ImageSeries, ImageSeries]:
+    B = fixed.images.shape[0]
+    f_min = fixed.images.view(B,-1).min(-1)[0]
+    m_min = moving.images.view(B,-1).min(-1)[0]
+       
+    min_val = th.min(f_min, m_min).view(B,1,1,1)
+
+    fixed.images -= min_val
+    moving.images -= min_val
+
+    moving_max = moving.images.view(B,-1).max(-1)[0]
+    fixed_max =   fixed.images.view(B,-1).max(-1)[0]
+    max_val = th.max(fixed_max, moving_max).view(B,1,1,1)
+
+    fixed.images /= max_val 
+    moving.images /= max_val
+    return (fixed, moving)
 
 
 def normalize_images(fixed_image, moving_image):

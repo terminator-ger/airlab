@@ -22,6 +22,45 @@ import cv2
 
 from . import kernelFunction
 
+class ImageSeries:
+    def __init__(self, *args, **kwargs):
+        self.initializeForTensors(*args)
+
+    def __getitem__(self, key):
+        return Image(self.images[key].unsqueeze(0), 
+                     [self.size[-2],self.size[-1]],
+                     self.spacing, 
+                     self.origin)
+
+    def initializeForTensors(self, tensor_image, image_size, image_spacing, image_origin):
+        """
+        Constructor for torch tensors and numpy ndarrays
+
+        Args:
+        tensor_image (np.ndarray | th.Tensor): n-dimensional tensor, where the last dimensions are the image dimensions while the preceeding dimensions need to empty
+        image_size (array | list | tuple): number of pixels in each space dimension
+        image_spacing (array | list | tuple): pixel size for each space dimension
+        image_origin (array | list | tuple): physical coordinate of the first pixel
+        :return (Image): an airlab image object
+        """
+
+        # distinguish between numpy array and torch tensors
+        #assert type(tensor_image) == np.ndarray
+        if type(tensor_image) == np.ndarray:
+            self.images = th.from_numpy(tensor_image).squeeze() #[b,c,w,h]
+        else:
+            self.images = tensor_image
+            if len(self.images.shape) == 3:
+                self.images = self.images.unsqueeze(1)
+
+        self.size = image_size
+        self.spacing = image_spacing
+        self.origin = image_origin
+        self.dtype = self.images.dtype
+        self.device = self.images.device
+        self.ndim = len(self.images.squeeze().shape) # take only non-empty dimensions to count space dimensions
+
+
 
 class Image:
     """
@@ -276,6 +315,10 @@ def image_from_numpy(image, pixel_spacing, image_origin, dtype=th.float32, devic
     tensor_image = tensor_image.to(dtype=dtype, device=device)
     return Image(tensor_image, image.shape, pixel_spacing, image_origin)
 
+def image_series_from_numpy(images, pixel_spacing, image_origin, dtype=th.float32, device='cpu') -> ImageSeries:
+    tensor_image = th.from_numpy(images)
+    tensor_image = tensor_image.to(dtype=dtype, device=device)
+    return ImageSeries(tensor_image, images.shape, pixel_spacing, image_origin)
 
 """
     Convert an image to tensor representation
@@ -316,47 +359,68 @@ def create_tensor_image_from_itk_image(itk_image, dtype=th.float32, device='cpu'
     Create an image pyramide  
 """
 def create_image_pyramid(image, down_sample_factor):
+    with th.no_grad():
+        image_dim = len(image.size)
+        image_pyramide = []
+        if image_dim == 2:
+            for level in down_sample_factor:
+                sigma = (th.tensor(level)/2.0).to(dtype=th.float32)
 
-    image_dim = len(image.size)
-    image_pyramide = []
-    if image_dim == 2:
+                kernel = kernelFunction.gaussian_kernel_2d(sigma.numpy(), asTensor=True)
+                padding = np.array([(x - 1)/2 for x in kernel.size()], dtype=int).tolist()
+                kernel = kernel.unsqueeze(0).unsqueeze(0)
+                kernel = kernel.to(dtype=image.dtype, device=image.device)
+
+                image_sample = F.conv2d(image.image, kernel, stride=level, padding=padding)
+                image_size = image_sample.size()[-image_dim:]
+                image_spacing = [x*y for x, y in zip(image.spacing, level)]
+                image_origin = image.origin
+                image_pyramide.append(Image(image_sample, image_size, image_spacing, image_origin))
+
+            image_pyramide.append(image)
+        elif image_dim == 3:
+            for level in down_sample_factor:
+                sigma = (th.tensor(level)/2.0).to(dtype=th.float32)
+
+                kernel = kernelFunction.gaussian_kernel_3d(sigma.numpy(), asTensor=True)
+                padding = np.array([(x - 1) / 2 for x in kernel.size()], dtype=int).tolist()
+                kernel = kernel.unsqueeze(0).unsqueeze(0)
+                kernel = kernel.to(dtype=image.dtype, device=image.device)
+
+                image_sample = F.conv3d(image.image, kernel, stride=level, padding=padding)
+                image_size = image_sample.size()[-image_dim:]
+                image_spacing = [x*y for x, y in zip(image.spacing, level)]
+                image_origin = image.origin
+                image_pyramide.append(Image(image_sample, image_size, image_spacing, image_origin))
+
+            image_pyramide.append(image)
+
+        else:
+            print("Error: ", image_dim, " is not supported with create_image_pyramide()")
+            sys.exit(-1)
+
+    return image_pyramide
+
+import pdb
+def create_image_series_pyramid(images: Image, down_sample_factor: float):
+    with th.no_grad():
+        image_pyramide = []
         for level in down_sample_factor:
             sigma = (th.tensor(level)/2.0).to(dtype=th.float32)
 
             kernel = kernelFunction.gaussian_kernel_2d(sigma.numpy(), asTensor=True)
             padding = np.array([(x - 1)/2 for x in kernel.size()], dtype=int).tolist()
             kernel = kernel.unsqueeze(0).unsqueeze(0)
-            kernel = kernel.to(dtype=image.dtype, device=image.device)
+            kernel = kernel.to(dtype=images.dtype, device=images.device)
+            image_sample = F.conv2d(images.images, kernel, stride=level, padding=padding)
+            image_size = image_sample.squeeze().size()
+            image_spacing = [x*y for x, y in zip(images.spacing, level)]
+            image_origin = images.origin
+            image_pyramide.append(ImageSeries(image_sample, image_size, image_spacing, image_origin))
 
-            image_sample = F.conv2d(image.image, kernel, stride=level, padding=padding)
-            image_size = image_sample.size()[-image_dim:]
-            image_spacing = [x*y for x, y in zip(image.spacing, level)]
-            image_origin = image.origin
-            image_pyramide.append(Image(image_sample, image_size, image_spacing, image_origin))
-
-        image_pyramide.append(image)
-    elif image_dim == 3:
-        for level in down_sample_factor:
-            sigma = (th.tensor(level)/2.0).to(dtype=th.float32)
-
-            kernel = kernelFunction.gaussian_kernel_3d(sigma.numpy(), asTensor=True)
-            padding = np.array([(x - 1) / 2 for x in kernel.size()], dtype=int).tolist()
-            kernel = kernel.unsqueeze(0).unsqueeze(0)
-            kernel = kernel.to(dtype=image.dtype, device=image.device)
-
-            image_sample = F.conv3d(image.image, kernel, stride=level, padding=padding)
-            image_size = image_sample.size()[-image_dim:]
-            image_spacing = [x*y for x, y in zip(image.spacing, level)]
-            image_origin = image.origin
-            image_pyramide.append(Image(image_sample, image_size, image_spacing, image_origin))
-
-        image_pyramide.append(image)
-
-    else:
-        print("Error: ", image_dim, " is not supported with create_image_pyramide()")
-        sys.exit(-1)
-
+        #image_pyramide.append(images)
     return image_pyramide
+   
 
 
 def toNP(x):
@@ -369,20 +433,33 @@ def mask_border(mask):
     mask[:,-1]=255
     return mask
 
-def get_mask(i1,i2):
-    from skimage import morphology
+
+def get_masks_for_image_series(i1,i2):
+    masks = []
+    for i in range(len(i1)):
+        masks.append(get_mask(i1[i,0], i2[i,0]))
+    masks = np.array(masks)[:,None]
+    return masks
+
+def get_mask(i1,i2, dilation = 5):
+    from skimage import morphology, util
+    
     if np.max(i1)<=1.0:
         i1 = (i1*255).astype(np.uint8)
         i2 = (i2*255).astype(np.uint8)
+    i1 = np.pad(i1, ((1,1),(1,1)))
+    i2 = np.pad(i2, ((1,1),(1,1)))
     _, thresh1 = cv2.threshold(i1, 1, 255, cv2.THRESH_BINARY_INV)
     _, thresh2 = cv2.threshold(i2, 1, 255, cv2.THRESH_BINARY_INV)
     # always mask border pixels
 
-    for _ in range(3):
+    for _ in range(dilation):
         thresh1 = morphology.binary_dilation(thresh1)
         thresh2 = morphology.binary_dilation(thresh2)
     thresh1 = mask_border(thresh1)
     thresh2 = mask_border(thresh2)
 
     mask = np.logical_or(thresh1, thresh2)
+    mask = mask[1:-1,1:-1]
     return mask
+

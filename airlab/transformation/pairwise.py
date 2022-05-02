@@ -13,12 +13,14 @@
 # limitations under the License.
 
 import pdb
+import cv2
+import matplotlib.pyplot as plt
 import torch as th
 from pytorch3d.transforms import euler_angles_to_matrix
 from torch.nn.parameter import Parameter
 import torch.nn.functional as F
 import numpy as np
-
+from kornia.geometry.transform import normalize_homography
 from ..utils import kernelFunction as utils
 from . import utils as tu
 
@@ -109,7 +111,6 @@ class _Transformation(th.nn.Module):
             return flow
         else:
             return flow + self._constant_flow
-
 
 class RigidTransformation(_Transformation):
     r"""
@@ -304,11 +305,85 @@ class RigidTransformation(_Transformation):
         self._compute_transformation()
         transformation_matrix = self._compute_transformation_matrix()
         flow = self._compute_dense_flow(transformation_matrix)
-
         return self._concatenate_flows(flow)
     
-    
+class LockedScaleSimilarityTransform(RigidTransformation):
+    r"""
+    Similarity centred transformation for 2D and 3D.
+    Args:
+        moving_image (Image): moving image for the registration
+        opt_cm (bool): using center of as parameter for the optimisation
+    """
+    def __init__(self, moving_image, opt_cm=False):
+        super(SimilarityTransformation, self).__init__(moving_image, opt_cm)
 
+        self._scale_factor = th.tensor(1.0, requires_grad=False)
+        self._scale_x = Parameter(th.tensor(1.0))
+        self._scale_y = self._scale_x * self._scale_factor
+
+        self._scale_matrix = None
+
+        if self._dim == 2:
+            self._compute_transformation = self._compute_transformation_2d
+        else:
+            self._compute_transformation = self._compute_transformation_3d
+
+            self._scale_z = Parameter(th.tensor(1.0))
+
+    def set_parameters(self, t, phi, scale, rotation_center=None):
+        """
+        Set parameters manually
+
+        t (array): 2 or 3 dimensional array specifying the spatial translation
+        phi (array): 1 or 3 dimensional array specifying the rotation angles
+        scale (array): 2 or 3 dimensional array specifying the scale in each dimension
+        rotation_center (array): 2 or 3 dimensional array specifying the rotation center (default is zeros)
+        """
+        super(SimilarityTransformation, self).set_parameters(t, phi, rotation_center)
+
+        self._scale_x = Parameter(th.tensor(scale[0]).to(dtype=self._dtype, device=self._device))
+        self._scale_factor = th.tensor(scale[1]/scale[0], requires_grad=False).to(dtype=self._dtype, device=self._device)
+
+
+        if len(t) == 2:
+            self._compute_transformation_2d()
+        else:
+            self._scale_z = Parameter(th.tensor(scale[2]).to(dtype=self._dtype, device=self._device))
+            self._compute_transformation_3d()
+
+    def _compute_transformation_2d(self):
+
+        super(SimilarityTransformation, self)._compute_transformation_2d()
+
+        self._scale_matrix = th.diag(th.ones(self._dim + 1, dtype=self._dtype, device=self._device))
+
+        self._scale_matrix[0, 0] = self._scale_x
+        self._scale_matrix[1, 1] = self._scale_y
+
+    def _compute_transformation_3d(self):
+
+        super(SimilarityTransformation, self)._compute_transformation_3d()
+
+        self._scale_matrix = th.diag(th.ones(self._dim + 1, dtype=self._dtype, device=self._device))
+
+        self._scale_matrix[0, 0] = self._scale_x
+        self._scale_matrix[1, 1] = self._scale_y
+        self._scale_matrix[2, 2] = self._scale_z
+
+    def _compute_transformation_matrix(self):
+        transformation_matrix = th.mm(th.mm(th.mm(th.mm(self._trans_matrix_pos, self._trans_matrix_cm),
+                                                  self._rotation_matrix), self._scale_matrix),
+                                      self._trans_matrix_cm_rw)[0:self._dim, :]
+
+        return transformation_matrix
+
+    def forward(self):
+
+        self._compute_transformation()
+        transformation_matrix = self._compute_transformation_matrix()
+        flow = self._compute_dense_flow(transformation_matrix)
+
+        return self._concatenate_flows(flow)
 
 class SimilarityTransformation(RigidTransformation):
     r"""
@@ -385,7 +460,6 @@ class SimilarityTransformation(RigidTransformation):
         flow = self._compute_dense_flow(transformation_matrix)
 
         return self._concatenate_flows(flow)
-
 
 class AffineTransformation(SimilarityTransformation):
     """
@@ -474,7 +548,107 @@ class AffineTransformation(SimilarityTransformation):
 
         return self._concatenate_flows(flow)
 
+class HomographyTransformation(_Transformation):
+    def __init__(self, moving_image, opt_cm=False):
+        super(HomographyTransformation, self).__init__(image_size=moving_image.size,
+                                                  dtype=moving_image.dtype,
+                                                  device=moving_image.device)
+ 
+        self._homography_matrix = Parameter(th.eye(3).to(dtype=self._dtype, device=self._device))
+        self._scale = th.eye(3).to(self._device)
 
+        grid = th.squeeze(tu.compute_grid(moving_image.size, dtype=self._dtype))
+
+        grid = th.cat((grid, th.ones(*[list(moving_image.size) + [1]], dtype=self._dtype)), self._dim)\
+               .to(device=self._device)
+
+        self.register_buffer("_grid", grid)
+        if self._dim == 2:
+            self._compute_displacement = self._compute_transformation_2d
+            self._compute_flow = self._compute_dense_flow
+            self._compute_transformation = self._compute_transformation_2d
+        else:
+            print('not implemented')
+
+    def set_parameters(self, d, r1=th.zeros(3), r2=th.zeros(3), k1=th.eye(3), k2=th.eye(3), t12=th.zeros(3), rotation_center=None):
+        """
+        Set parameters manually
+
+        t (array): 2 or 3 dimensional array specifying the spatial translation
+        r1, r2: euler rotations in !RAD!
+        """
+        # pass args to affine transformation
+
+        self._rot1 = th.tensor(r1).to(dtype=self._dtype, device=self._device)
+        self._rot2 = th.tensor(r2).to(dtype=self._dtype, device=self._device)
+        self._d    = th.tensor(d).to(dtype=self._dtype, device=self._device)
+        self._t12  = th.tensor(t12).to(dtype=self._dtype, device=self._device)
+
+        r1 = euler_angles_to_matrix(self._rot1, "XYZ")
+        r2 = euler_angles_to_matrix(self._rot2, "XYZ")
+        Rot = r2 @ th.inverse(r1)
+
+        n = r1 @ th.tensor([[0,0,-1]]).T.to(r1)
+        n = n / th.linalg.norm(n, ord=1)
+
+        T = (self._t12.T @ n.T)/self._d
+        self._homography_matrix = th.nn.parameter.Parameter(Rot + T)
+
+        
+        self._k1  = th.nn.parameter.Parameter(th.tensor(k1).to(dtype=self._dtype, device=self._device) , requires_grad=False)
+        self._k2  = th.nn.parameter.Parameter(th.tensor(k2).to(dtype=self._dtype, device=self._device) , requires_grad=False)
+
+    def set_scale(self, S):
+        self._scale = th.tensor([[S, 0, 0],
+                                 [0, S, 0],
+                                 [0, 0, 1]], dtype=self._dtype, device=self._device)
+
+    def get_parameters(self):
+        return self._d, self._rot1, self._rot2, self._t12
+
+    def get_homography(self):
+        return self._k2 @ self._homography_matrix @ th.inverse(self._k1)
+    
+    def set_homography(self, h=th.eye(3), k1=th.eye(3), k2=th.eye(3)):
+        self._k1  = th.nn.parameter.Parameter(th.tensor(k1).to(dtype=self._dtype, device=self._device) , requires_grad=False)
+        self._k2  = th.nn.parameter.Parameter(th.tensor(k2).to(dtype=self._dtype, device=self._device) , requires_grad=False)
+        H = th.inverse(self._k2) @ th.tensor(h).to(dtype=self._dtype, device=self._device) @ self._k1
+        self._homography_matrix = th.nn.parameter.Parameter(H)
+
+
+
+    def _compute_transformation(self):
+        self._compute_transformation_2d()
+
+    def _compute_transformation_2d(self):
+        H = self._k1 @ self._homography_matrix @ th.inverse(self._k1)
+        H = self._scale @ H @ th.inverse(self._scale)
+        self._H = normalize_homography(H, self._image_size, self._image_size)[0]
+
+    def _compute_transformation_matrix(self):
+        # TODO: check shift center and translation are in correct order
+        transformation_matrix = self._H
+        return transformation_matrix
+
+    def _compute_dense_flow(self, transformation_matrix=th.eye(3)):
+        if  transformation_matrix.cpu().equal(th.eye(3)):
+            transformation_matrix = self._compute_transformation_matrix()
+
+        displacement = th.mm(self._grid.view(np.prod(self._image_size).tolist(), self._dim + 1),
+                         transformation_matrix.t()).view(*(self._image_size.tolist()), 3)
+        displacement = th.div(displacement[:, :, :self._dim], displacement[:, :, self._dim].view(*(self._image_size).tolist(), 1))
+        self._displacement = displacement
+        displacement = displacement - self._grid[..., :self._dim]
+        return displacement
+
+    def get_transformation_matrix(self):
+        return self._compute_transformation_matrix().cpu().detach().numpy()
+
+    def forward(self):
+        self._compute_transformation()
+        transformation_matrix = self._compute_transformation_matrix()
+        flow = self._compute_dense_flow(transformation_matrix)
+        return self._concatenate_flows(flow)
 
 class PerspectiveTransformation(AffineTransformation):
     """
@@ -500,14 +674,7 @@ class PerspectiveTransformation(AffineTransformation):
             self._compute_displacement = self._compute_transformation_2d
             self._compute_flow = self._compute_dense_flow
         else:
-            # Not implemented
             print('not implemented')
-#                self._compute_displacement = self._compute_transformation_3d
-#
-#                self._shear_z_x = Parameter(th.tensor(0.0))
-#                self._shear_z_y = Parameter(th.tensor(0.0))
-#                self._shear_x_z = Parameter(th.tensor(0.0))
-#                self._shear_y_z = Parameter(th.tensor(0.0))
 
     def set_parameters(self, t, phi, scale, shear, distort, rotation_center=None):
         """
@@ -525,16 +692,6 @@ class PerspectiveTransformation(AffineTransformation):
 
         self._px = th.nn.parameter.Parameter(th.tensor(distort[0]).to(dtype=self._dtype, device=self._device))
         self._py = th.nn.parameter.Parameter(th.tensor(distort[1]).to(dtype=self._dtype, device=self._device))
-
-       # if len(t) == 2:
-       #     self._compute_transformation_2d()
-       # else:
-       #     print('not implemented')
-            #self._shear_z_x = Parameter(th.tensor(shear[2]).to(dtype=self._dtype, device=self._device))
-            #self._shear_z_y = Parameter(th.tensor(shear[3]).to(dtype=self._dtype, device=self._device))
-            #self._shear_x_z = Parameter(th.tensor(shear[4]).to(dtype=self._dtype, device=self._device))
-            #self._shear_y_z = Parameter(th.tensor(shear[5]).to(dtype=self._dtype, device=self._device))
-            #self._compute_transformation_3d()
 
     def _compute_transformation_2d(self):
         super(PerspectiveTransformation, self)._compute_transformation_2d()
@@ -567,7 +724,7 @@ class PerspectiveTransformation(AffineTransformation):
         return displacement
 
     def get_transformation_matrix(self):
-        return self._compute_transformation_matrix().cpu().detach().numpy()
+        return self._compute_transformation_matrix()
 
     def forward(self):
         self._compute_transformation()
@@ -575,7 +732,7 @@ class PerspectiveTransformation(AffineTransformation):
         flow = self._compute_dense_flow(transformation_matrix)
         return self._concatenate_flows(flow)
 
-class DualCameraRegistration(_Transformation):
+class DualCameraTransformation(_Transformation):
     """
     Perspective centred transformation for 2D and 3D.
 
@@ -584,18 +741,21 @@ class DualCameraRegistration(_Transformation):
         opt_cm (bool): using center of as parameter for the optimisation
     """
     def __init__(self, moving_image, opt_cm=False):
-        super(DualCameraRegistration, self).__init__(image_size=moving_image.size,
+        super(DualCameraTransformation, self).__init__(image_size=moving_image.size,
                                                   dtype=moving_image.dtype,
                                                   device=moving_image.device)
         self._opt_cm = opt_cm
         self._d = th.nn.parameter.Parameter(th.tensor(10.0)).to(dtype=th.float, device=self._device )
-        self._rot = th.nn.parameter.Parameter(th.tensor([0.0, 0.0, 0.0])).to(device=self._device)
+        self._rot1 = th.nn.parameter.Parameter(th.tensor([0.0, 0.0, 0.0])).to(device=self._device)
+        self._rot2 = th.nn.parameter.Parameter(th.tensor([0.0, 0.0, 0.0])).to(device=self._device)
         # paramters assued fix
         self._t12 = th.nn.parameter.Parameter(th.tensor([0.0, 0.0, 0.0],dtype=th.float), requires_grad=False).to(device=self._device)
-#        self._k1 = th.nn.parameter.Parameter(th.eye(3,dtype=th.float), requires_grad=False).to(device=self._device)
-#        self._k2 = th.nn.parameter.Parameter(th.eye(3,dtype=th.float), requires_grad=False).to(device=self._device)
+        self._k1 = th.nn.parameter.Parameter(th.eye(3,dtype=th.float), requires_grad=False).to(device=self._device)
+        self._k2 = th.nn.parameter.Parameter(th.eye(3,dtype=th.float), requires_grad=False).to(device=self._device)
 
+        self._displacement = None
         self._homogenus = None
+        self._scale = th.eye(3).to(self._device)
 
         grid = th.squeeze(tu.compute_grid(moving_image.size, dtype=self._dtype))
 
@@ -610,7 +770,6 @@ class DualCameraRegistration(_Transformation):
 
             self._center_mass_x = th.nn.parameter.Parameter(self._center_mass_x)
             self._center_mass_y = th.nn.parameter.Parameter(self._center_mass_y)
-
         if self._dim == 2:
             self._compute_displacement = self._compute_transformation_2d
             self._compute_flow = self._compute_dense_flow
@@ -640,40 +799,42 @@ class DualCameraRegistration(_Transformation):
             self._t_y = Parameter(self._center_mass_y - fixed_image_center_mass_y)
 
         if self._dim == 3:
-            fixed_image_center_mass_z = th.sum(fixed_image.image.squeeze() * self._grid[..., 2]) / intensity_sum
+            fixed_image_center_mass_z = th.sum(fixed_image.image.squeeze() * self._grid[..., 2]) / intensity_sum 
             self._t_z = Parameter(self._center_mass_z - fixed_image_center_mass_z)
     
-    def init_rotation(self, rot):
-        self._rot = th.nn.parameter.Parameter(rot)
+    def init_rotation(self, rot1, rot2):
+        self._rot1 = th.nn.parameter.Parameter(rot1)
+        self._rot2 = th.nn.parameter.Parameter(rot2)
 
-    def set_parameters(self, d, rot=th.zeros(3), k1=th.eye(3), k2=th.eye(3), t12=th.zeros(3), rotation_center=None):
+    def set_parameters(self, d, r1=th.zeros(3), r2=th.zeros(3), k1=th.eye(3), k2=th.eye(3), t12=th.zeros(3), rotation_center=None):
         """
         Set parameters manually
 
         t (array): 2 or 3 dimensional array specifying the spatial translation
-        phi (array): 1 or 3 dimensional array specifying the rotation angles
-        scale (array): 2 or 3 dimensional array specifying the scale in each dimension
-        shear (array): 2 or 6 dimensional array specifying the shear in each dimension: yx, xy, zx, zy, xz, yz
-        distort (array): 2 dimensional array specifying the homographic distortion in each dimension x,y
-        rotation_center (array): 2 or 3 dimensional array specifying the rotation center (default is zeros)
+        r1, r2: euler rotations in !RAD!
         """
         # pass args to affine transformation
 
         self._d  = th.nn.parameter.Parameter(th.tensor(d).to(dtype=self._dtype, device=self._device))
-        self._rot= th.nn.parameter.Parameter(th.tensor(rot).to(dtype=self._dtype, device=self._device))
+        self._rot1= th.nn.parameter.Parameter(th.tensor(r1).to(dtype=self._dtype, device=self._device))
+        self._rot2= th.nn.parameter.Parameter(th.tensor(r2).to(dtype=self._dtype, device=self._device))
 
-        self._t12 = th.nn.parameter.Parameter(th.tensor(t12).to(dtype=self._dtype, device=self._device))
-#        self._k1 = th.nn.parameter.Parameter(th.tensor(k1).to(dtype=self._dtype, device=self._device))
-#        self._k2 = th.nn.parameter.Parameter(th.tensor(k2).to(dtype=self._dtype, device=self._device))
+        self._t12 = th.nn.parameter.Parameter(th.tensor(t12).to(dtype=self._dtype, device=self._device), requires_grad=False)
+        self._k1  = th.nn.parameter.Parameter(th.tensor(k1).to(dtype=self._dtype, device=self._device) , requires_grad=False)
+        self._k2  = th.nn.parameter.Parameter(th.tensor(k2).to(dtype=self._dtype, device=self._device) , requires_grad=False)
 
+    def set_scale(self, S):
+        self._scale = th.tensor([[S, 0, 0],
+                                 [0, S, 0],
+                                 [0, 0, 1]], dtype=self._dtype, device=self._device)
+
+    def get_parameters(self):
+        return self._d, self._rot1, self._rot2, self._t12
+
+    def _compute_transformation(self):
+        self._compute_transformation_2d()
 
     def _compute_transformation_2d(self):
-        self._trans_matrix_pos = th.diag(th.ones(self._dim + 1, dtype=self._dtype, device=self._device))
-        self._trans_matrix_cm = th.diag(th.ones(self._dim + 1, dtype=self._dtype, device=self._device))
-        self._trans_matrix_cm_rw = th.diag(th.ones(self._dim + 1, dtype=self._dtype, device=self._device))
-        self._rotation_matrix = th.zeros(self._dim + 1, self._dim + 1, dtype=self._dtype, device=self._device)
-        self._rotation_matrix[-1, -1] = 1
-
         if self._opt_cm:
             self._trans_matrix_cm[0, 2] = -self._center_mass_x
             self._trans_matrix_cm[1, 2] = -self._center_mass_y
@@ -683,30 +844,45 @@ class DualCameraRegistration(_Transformation):
 
 
         self._homogenus = th.eye(3)
-        Rot = euler_angles_to_matrix(self._rot, "XYZ")
+        r1 = euler_angles_to_matrix(self._rot1, "XYZ")
+        r2 = euler_angles_to_matrix(self._rot2, "XYZ")
+        Rot = r2 @ th.inverse(r1)
 
-        H = Rot
-        T = (-Rot @ self._t12)/self._d
-        H[:,2] += T
-        self._trans_matrix_pos = T
-        self._rotation_matrix = Rot
-        #self._homogenus = self._k2 @ H @ th.inverse(self._k1)
-        self._homogenus = th.inverse(H)
+        n = r1 @ th.tensor([[0,0,-1]]).T.to(r1)
+        n = n / th.linalg.norm(n, ord=1)
+
+        T = (self._t12.T @ n.T)/self._d
+        H = Rot + T
+        H = self._k1 @ H @ th.inverse(self._k1)
+        H = self._scale @ H @ th.inverse(self._scale)
+        self._homogenus = normalize_homography(H, self._image_size, self._image_size)[0]
+    
+    def get_homography(self):
+        if self._opt_cm:
+            self._trans_matrix_cm[0, 2] = -self._center_mass_x
+            self._trans_matrix_cm[1, 2] = -self._center_mass_y
+
+            self._trans_matrix_cm_rw[0, 2] = self._center_mass_x
+            self._trans_matrix_cm_rw[1, 2] = self._center_mass_y
+
+
+        self._homogenus = th.eye(3)
+        r1 = euler_angles_to_matrix(self._rot1, "XYZ")
+        r2 = euler_angles_to_matrix(self._rot2, "XYZ")
+        Rot = r2 @ th.inverse(r1)
+
+        n = r1 @ th.tensor([[0,0,-1]]).T.to(r1)
+        n = n / th.linalg.norm(n, ord=1)
+
+        T = (self._t12.T @ n.T)/self._d
+        H = Rot + T
+
+        return self._k2 @ H @ th.inverse(self._k1)
         
-
 
     def _compute_transformation_matrix(self):
         # TODO: check shift center and translation are in correct order
         transformation_matrix = self._homogenus
-#        th.mm(
-#                                    th.mm(
-#                                        th.mm(
-#                                            th.mm(self._trans_matrix_pos, 
-#                                                  self._trans_matrix_cm),
-#                                            th.inverse(self._k1)),
-#                                        self._k2),
-#                                    self._trans_matrix_cm_rw)
-
         return transformation_matrix
 
     def _compute_dense_flow(self, transformation_matrix=th.eye(3)):
@@ -716,6 +892,7 @@ class DualCameraRegistration(_Transformation):
         displacement = th.mm(self._grid.view(np.prod(self._image_size).tolist(), self._dim + 1),
                          transformation_matrix.t()).view(*(self._image_size.tolist()), 3)
         displacement = th.div(displacement[:, :, :self._dim], displacement[:, :, self._dim].view(*(self._image_size).tolist(), 1))
+        self._displacement = displacement
         displacement = displacement - self._grid[..., :self._dim]
         return displacement
 

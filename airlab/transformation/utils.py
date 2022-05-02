@@ -19,6 +19,29 @@ from ..utils import image as iutils
 
 import SimpleITK as sitk
 
+def compute_grid_batch(image_size, dtype=th.float32, device='cpu'):
+    if len(image_size) < 3:
+        B = 1
+        nx = image_size[0]
+        ny = image_size[1]
+    else:
+        B = image_size[0]
+        nx = image_size[1]
+        ny = image_size[2]
+
+
+    x = th.linspace(-1, 1, steps=ny).to(dtype=dtype)
+    y = th.linspace(-1, 1, steps=nx).to(dtype=dtype)
+
+    x = x.expand(nx, -1)
+    y = y.expand(ny, -1).transpose(0, 1)
+
+    x.unsqueeze_(0).unsqueeze_(3)
+    y.unsqueeze_(0).unsqueeze_(3)
+
+    return th.cat((x, y), 3).to(dtype=dtype, device=device).repeat(B, 1, 1, 1)
+
+
 def compute_grid(image_size, dtype=th.float32, device='cpu'):
 
     dim = len(image_size)

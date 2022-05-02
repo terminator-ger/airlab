@@ -31,6 +31,18 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import airlab as al
 from airlab.utils.image import image_from_numpy
+from PIL import ImageOps
+
+
+def padding(img, expected_size):
+    desired_size = imgCVShape(expected_size) 
+    cur_size = imgCVShape(img)
+    delta_width = desired_size[0] - cur_size[0]
+    delta_height = desired_size[1] - cur_size[1]
+    pad_width = delta_width // 2
+    pad_height = delta_height // 2
+    return cv2.copyMakeBorder(img, pad_height, pad_height, pad_width, pad_width, cv2.BORDER_CONSTANT, value=0)
+
 
 def calc_h(r1,r2, t12, k1, k2, d):
     Rb = Rotation.from_euler('xyz', r1, degrees=True).as_matrix() 
@@ -41,7 +53,7 @@ def calc_h(r1,r2, t12, k1, k2, d):
     tmp = (-Rot @ t12)/d
     H[:,2] += tmp
 
-    H = k2 @ H @ np.linalg.inv(k1)
+    H = k1 @ H @ np.linalg.inv(k1)
     H = H/H[2,2]
     return H
 
@@ -76,16 +88,19 @@ def main():
 
     d = 7500.0
     H = calc_h(r1, r2, t12, k1, k2, d)
-    print(H)
+
     img2 = cv2.imread('./data/dual_camera_test_image_2d_moving.png')
     img1 = cv2.imread('./data/dual_camera_test_image_2d_fixed.png')
-
-    img2 = cv2.warpPerspective(img2, np.linalg.inv(H), imgCVShape(img1))
-
     img1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
     img2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
-    plt.imshow(np.dstack((img1,img2,img1))) 
-    plt.show()
+    img2 = cv2.warpPerspective(img2, np.linalg.inv(k2 @ np.eye(3) @ np.linalg.inv(k1)), imgCVShape(img1))
+    print(np.linalg.inv(H))
+#    img2 = cv2.warpPerspective(img2, np.linalg.inv(H), imgCVShape(img1))
+#    plt.imshow(np.dstack((img1,img2,img1)))
+#    plt.show()
+                               
+
+
     dtype = th.float32
     moving_image = image_from_numpy(img2,
                                     pixel_spacing=(1,1),
@@ -111,7 +126,12 @@ def main():
     transformation = al.transformation.pairwise.DualCameraRegistration(moving_image, opt_cm=False)
     # initialize the translation with the center of mass of the fixed image
     #transformation.init_translation(fixed_image)
-    transformation.set_parameters(7500)
+    Rb = Rotation.from_euler('xyz', r1, degrees=True).as_matrix() 
+    Ra = Rotation.from_euler('xyz', r2, degrees=True).as_matrix() 
+
+    Rot = Ra @ np.linalg.inv(Rb)
+    Rot = Rotation.from_matrix(Rot).as_euler('xyz').copy()
+    transformation.set_parameters(7500, Rot, k1=k1, k2=k2, t12=t12)
 
     registration.set_transformation(transformation)
     
