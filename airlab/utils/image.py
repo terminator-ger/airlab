@@ -310,6 +310,10 @@ def create_image_from_image(tensor_image, image):
 """
     Convert numpy image to AirlLab image format
 """
+def image_from_tensor(image, pixel_spacing, image_origin, dtype=th.float32, device='cpu'):
+    image = image.to(dtype=dtype, device=device)
+    return Image(image, image.shape, pixel_spacing, image_origin)
+
 def image_from_numpy(image, pixel_spacing, image_origin, dtype=th.float32, device='cpu'):
     tensor_image = th.from_numpy(image).unsqueeze(0).unsqueeze(0)
     tensor_image = tensor_image.to(dtype=dtype, device=device)

@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from requests import patch
+import cv2
+from decimal import localcontext
+from re import A
+from tkinter import N
+from xmlrpc.server import DocXMLRPCRequestHandler
 import torch as th
 import torch.nn.functional as F
 from Image import toByteImage
@@ -26,6 +32,11 @@ from ..utils import kernelFunction as utils
 from ..utils.image import get_masks_for_image_series, toNP, get_mask, ImageSeries
 import pdb
 import math
+from torchgeometry.image.gaussian import gaussian_blur
+from itertools import product
+
+th.pi = th.acos(th.zeros(1)).item() * 2 # which is 3.1415927410125732
+from airlab.loss.torchgeomspace import geomspace
 
 
 class DMR(th.nn.Module):
@@ -686,8 +697,8 @@ class MI(_PairwiseImageLoss):
             reduce (bool): Reduce loss function to a single value
 
     """
-    def __init__(self, fixed_image, moving_image, fixed_mask=None, moving_mask=None, bins=64, sigma=3,
-                 spatial_samples=0.1, background=None, size_average=True, reduce=True):
+    def __init__(self, fixed_image, moving_image, fixed_mask=None, moving_mask=None, bins=64, sigma=0.1,
+                 spatial_samples=1, background=None, size_average=True, reduce=True):
         super(MI, self).__init__(fixed_image, moving_image, fixed_mask, moving_mask, size_average, reduce)
 
         self._name = "mi"
@@ -732,7 +743,6 @@ class MI(_PairwiseImageLoss):
         return self._bins_fixed_image
 
     def _compute_marginal_entropy(self, values, bins):
-        pdb.set_trace()
         p = th.exp(-((values - bins).pow(2).div(self._sigma))).div(self._normalizer_1d)
         p_n = p.mean(dim=1)
         p_n = p_n/(th.sum(p_n) + 1e-10)
@@ -760,7 +770,8 @@ class MI(_PairwiseImageLoss):
         number_of_pixel = moving_image_valid.shape[0]
 
         sample = th.zeros(number_of_pixel, device=self._fixed_image.device,
-                          dtype=self._fixed_image.dtype).uniform_() < self._spatial_samples
+                          dtype=self._fixed_image.dtype).uniform_() 
+        sample = sample < self._spatial_samples
 
         # compute marginal entropy fixed image
         image_samples_fixed = th.masked_select(fixed_image_valid.view(-1), sample)
@@ -1425,20 +1436,21 @@ class dNTG(_PairwiseImageLoss):
 
 
         metric = th.div(m, th.add(n1,n2))
-        if self.debug:
+        if self.debug and self.cnt % 5 == 0:
             img1 = (delta).cpu().detach().numpy()[0, 0]
             img2 = (i1x-i2x).cpu().detach().numpy()[0, 0]
             img3 = (i1y-i2y).cpu().detach().numpy()[0, 0]
             mov = (self.warped_moving_image).cpu().detach().numpy()[0, 0]
             fix = (self._fixed_image.image).cpu().detach().numpy()[0, 0]
 
-            self.plt.set_data(np.dstack((mov,fix,mov)))
+            #self.plt.set_data(np.dstack((mov,fix,mov)))
+            img = (np.dstack((mov,fix,mov)) * 255).astype(np.uint8)
+            cv2.imwrite('tmp/{}_{}.png'.format(self._fixed_image.image.shape, self.cnt), img)
             #plt.draw()
             #plt.pause(0.0001)
-            if self.cnt % 5 == 0:
-                plt.savefig('{}.png'.format(self.cnt), dpi=400)
+                #plt.savefig('{}.png'.format(self.cnt), dpi=400)
 
-            self.cnt += 1
+        self.cnt += 1
         return metric
 
 
@@ -1547,17 +1559,16 @@ class MINDLoss(_PairwiseImageLoss):
         device = fixed_image.device
         self._device = device
 
+        self.R = 2
         self._moving_mask = moving_mask.to(self._device)
         self._fixed_mask = fixed_mask.to(self._device)
-        self.MIND =MINDV2(device=device,
-                        non_local_region_size =non_local_region_size,
-                        patch_size =patch_size,
-                        neighbor_size =neighbor_size,
-                        gaussian_patch_sigma =gaussian_patch_sigma)
+        self.MIND =MINDV2(device=device, R=self.R, sigma=0.5)
+
         with th.no_grad():
             self.in_mind = self.MIND(fixed_image.image, self._fixed_mask)
             self.tar_mind = self.MIND(moving_image.image, self._moving_mask)
         self.debug=debug
+        self.t = 0
 
         if self.debug:
             from  matplotlib import pyplot as plt
@@ -1571,12 +1582,14 @@ class MINDLoss(_PairwiseImageLoss):
     def forward(self, displacement):
         displacement = self._grid + displacement
         # warp moving image with dispalcement field
-        with th.no_grad():
-            self._warped_moving_image = F.grid_sample(self._moving_image.image, displacement)
-            self._warped_moving_mask = F.grid_sample(self._moving_mask.to(th.float32), displacement, padding_mode='border').to(bool)
+        #with th.no_grad():
+        self._warped_moving_image = F.grid_sample(self._moving_image.image, displacement)
+        self._warped_moving_mask = F.grid_sample(self._moving_mask.to(th.float32), displacement, padding_mode='border').to(bool)
 
+        #???????
         self.tar_mind = self.MIND(self._warped_moving_image, self._warped_moving_mask)
-        mind_moving = F.grid_sample(self.tar_mind, displacement)
+        #mind_moving = F.grid_sample(self.tar_mind, displacement)
+        mind_moving = self.tar_mind
 
         # warp masks
         mask = (self._warped_moving_mask | self._fixed_mask).to(self._device)
@@ -1586,15 +1599,17 @@ class MINDLoss(_PairwiseImageLoss):
         mind_diff = th.masked_fill(mind_diff, mask, 0)
         l1 =th.norm( mind_diff, 1)
 
-        if self.debug:
-            self._warped_moving_image = F.grid_sample(self._moving_image.image, displacement)
+        mind_loss = l1 / ((2*self.R)**2-1)
+        if self.debug and self.t % 5 == 0:
+            #self._warped_moving_image = F.grid_sample(self._moving_image.image, displacement)
             mov = (self._warped_moving_image).cpu().detach().numpy()[0, 0]
             fix = (self._fixed_image.image).cpu().detach().numpy()[0, 0]
 
-            self.plt.set_data(np.dstack((mov,fix,mov)))
-            plt.draw()
-            plt.pause(0.0001)
-        return l1/(self._fixed_image.image.shape[2] *self._fixed_image.image.shape[3] *self.nl_size *self.nl_size)
+            img = (np.dstack((mov,fix,mov))*255).astype(np.uint8)
+            cv2.imwrite('tmp/{}_{}.png'.format(self._fixed_image.image.shape, self.t), img)
+        self.t += 1
+
+        return mind_loss
 
 
 class DMRLoss(_PairwiseImageLoss):
@@ -1629,10 +1644,6 @@ class DMRLoss(_PairwiseImageLoss):
         img_stack = tv.transforms.Resize(128)(img_stack)
         loss = self.DMR(img_stack)
         return loss
-
-
-
-
 
 class CrossCorrelation(_PairwiseImageLoss):
     def __init__(self,
@@ -1679,7 +1690,6 @@ class CrossCorrelation(_PairwiseImageLoss):
         val = th.max(cc)
         s = th.tensor(cc.size())
         return th.tensor((val,pos,s[2],s[3]))#pad[0], pad[1]))
-
 
 class SSC(th.nn.Module):
 
@@ -1802,6 +1812,7 @@ class SSCLoss(_PairwiseImageLoss):
         self.in_mind = fixed_image.image
         self.tar_mind = moving_image.image
         self.debug=debug
+        self.t = 0
 
         if self.debug:
             from  matplotlib import pyplot as plt
@@ -1820,6 +1831,7 @@ class SSCLoss(_PairwiseImageLoss):
         # warp masks
         self._warped_moving_mask = F.grid_sample(self._moving_mask.to(th.float32), displacement, padding_mode='border').to(bool)
         mask = (self._warped_moving_mask | self._fixed_mask).to(self._device)
+        
         # get SSC descriptors
         SSC_moving = self.SSC(self._warped_moving_image, self._warped_moving_mask)
         SSC_fixed = self.SSC(self._fixed_image.image, self._fixed_mask)
@@ -1829,140 +1841,511 @@ class SSCLoss(_PairwiseImageLoss):
         l1 =th.norm( SSC_diff, 1)
 
 
-        if self.debug:
+        if self.debug and self.t % 5 == 0:
             mov = (self._warped_moving_image).cpu().detach().numpy()[0, 0]
             fix = (self._fixed_image.image).cpu().detach().numpy()[0, 0]
+            img = (np.dstack((mov,fix,mov))*255).astype(np.uint8)
+            cv2.imwrite('tmp/{}_{}.png'.format(self._fixed_image.image.shape, self.t), img)
+        self.t += 1
 
-            self.plt.set_data(np.dstack((mov,fix,mov)))
-            plt.draw()
-            plt.pause(0.0001)
         return l1/(self._fixed_image.image.shape[2] *self._fixed_image.image.shape[3] *self.nl_size *self.nl_size)
-
-
-
-
 
 class MINDV2(th.nn.Module):
 
     def __init__(self, device=th.device('cpu'),
-                 non_local_region_size =3,
-                 patch_size =3,
-                 neighbor_size =3,
-                 gaussian_patch_sigma =1.0):
+                 R = 4,
+                 sigma = 0.5):
 
         super(MINDV2, self).__init__()
-        self.nl_size =non_local_region_size
-        self.p_size =patch_size
-        self.n_size =neighbor_size
-        self.sigma2 =gaussian_patch_sigma *gaussian_patch_sigma
+        self.sigma = sigma
         self.device = device
-        self.nbr = 4
+        self.R = R
+
+        def conv(R=0, sampling='4nbr'):
+            if R == 0:
+                out_channels = 4
+                kernel_size = (3,3)
+                padding = (1,1)
+                if sampling == '4nbr':
+                    idx = [[0,1],[1,0],[2,1],[1,2]]
+                elif sampling == 'id':
+                    idx = [[1,1],[1,1],[1,1],[1,1]]
+
+            elif R > 0 and sampling == 'dense':
+                out_channels = (2*R+1)**2 - 1
+                kernel_size = (2*R+1, 2*R+1)
+                padding = tuple((k-1)//2 for k in kernel_size)
+                idx = []
+                for j in range(np.prod(kernel_size)):
+                    x = j % kernel_size[0]
+                    y = j // kernel_size[1]
+                    if (x,y) != tuple(k//2 for k in kernel_size):
+                        # skip neutral element in the center
+                        idx.append([x,y])
+
+            elif R > 0 and sampling == 'id':
+                out_channels = (2*R+1)**2 - 1
+                kernel_size = (2*R+1, 2*R+1)
+                padding = tuple((k-1)//2 for k in kernel_size)
+                idx = []
+                for j in range(np.prod(kernel_size)):
+                    x = kernel_size[0] // 2
+                    y = kernel_size[1] // 2
+                    idx.append([x,y])
+
+            elif R > 0 and sampling == 'sparse':
+                # todo
+                raise NotImplementedError("")
+            c = th.nn.Conv2d(in_channels= 1, 
+                                out_channels=out_channels,
+                                kernel_size=kernel_size,
+                                stride=1, 
+                                padding= padding,
+                                dilation=1, 
+                                groups=1, 
+                                bias=False, 
+                                padding_mode='zeros').to(self.device)
+
+            for i in range(out_channels):
+                t = th.zeros((1, kernel_size[0], kernel_size[1]))
+                t[0, idx[i][0], idx[i][1] ] = 1
+                c.weight.data[i] = t
+
+            return c
 
 
-        # calc shifted images in non local region
-        self.image_shifter = th.nn.Conv2d(in_channels =1, out_channels = 8,
-                                            kernel_size =(self.p_size, self.p_size),
-                                            stride=1, padding=((self.p_size-1)//2, (self.p_size-1)//2),
-                                            dilation=1, groups=1, bias=False, padding_mode='zeros').to(device)
-        idx = [[0,0],[0,1],[0,2],
-               [1,0],[1,2],
-               [2,0],[2,1],[2,2]]
-        for i in range(8):
-            t = th.zeros((1, self.p_size, self.p_size))
-            t[0,idx[i][0], idx[i][1] ] = 1
-            self.image_shifter.weight.data[i] = t
 
-        # patch summation
-        self.summation_patcher =th.nn.Conv2d(in_channels = 8,
-                                             out_channels = 8,
-                                              kernel_size =(self.p_size, self.p_size),
-                                              stride=1, padding=((self.p_size-1)//2, (self.p_size-1)//2),
-                                              dilation=1, groups=8, bias=False, padding_mode='zeros').to(device)
-        t =th.zeros((1, self.p_size, self.p_size))
-        cx =(self.p_size-1)//2
-        cy =(self.p_size-1)//2
-        for j in range(self.p_size *self.p_size):
-            x=j%self.p_size
-            y=j//self.p_size
-            d2 =th.norm( th.tensor([x-cx, y-cy]).float(), 2)
-            t[0, x, y] =math.exp(-d2 / self.sigma2)
+        self.neighbors_4 = conv(0, '4nbr')
+        self.neighbors_R = conv(R, 'dense' if R > 0 else '4nbr')
+        self.image_shifter_origin_4 = conv(0, 'id')
+        self.image_shifter_origin_R = conv(R, 'id')
 
-        for i in range(8):
-            # gaussian kernel
-            self.summation_patcher.weight.data[i] = t
+        self.filt_s = int(np.ceil(self.sigma*3/2)*2+1)
 
 
-        self.neighbors =th.nn.Conv2d(in_channels =1, out_channels = 4,
-                                        kernel_size =(self.n_size, self.n_size),
-                                        stride=1, padding=((self.n_size-1)//2, (self.n_size-1)//2),
-                                        dilation=1, groups=1, bias=False, padding_mode='zeros').to(device)
-        idx = [[0,1],[1,0],[2,1],[1,2]]
-        for i in range(self.nbr):
-            t = th.zeros((1, self.p_size, self.p_size))
-            t[0,idx[i][0], idx[i][1] ] = 1
-            self.neighbors.weight.data[i] = t
-
-
-        # neighbor patcher for calculating noise estimate
-        self.neighbor_summation_patcher =th.nn.Conv2d(in_channels =self.nbr,
-                                                out_channels =self.nbr,
-                                               kernel_size =(self.p_size, self.p_size),
-                                               stride=1, padding=((self.p_size-1)//2, (self.p_size-1)//2),
-                                               dilation=1, groups=self.nbr, bias=False, padding_mode='zeros').to(device)
-        t =th.zeros((1, self.p_size, self.p_size))
-        cx =(self.p_size-1)//2
-        cy =(self.p_size-1)//2
-        for j in range(self.p_size *self.p_size):
-            x=j%self.p_size
-            y=j//self.p_size
-            d2 =th.norm( th.tensor([x-cx, y-cy]).float(), 2)
-            t[0, x, y] =math.exp(-d2 / self.sigma2)
-        for i in range(self.nbr):
-            self.neighbor_summation_patcher.weight.data[i] =t
-
-        self.image_shifter_origin = th.nn.Conv2d(in_channels =1, out_channels = 1,
-                                        kernel_size =(self.n_size, self.n_size),
-                                        stride=1, padding=((self.n_size-1)//2, (self.n_size-1)//2),
-                                        dilation=1, groups=1, bias=False, padding_mode='zeros').to(device)
-        idx = [[1,1]]
-        for i in range(1):
-            t = th.zeros((1, self.p_size, self.p_size))
-            t[0,idx[i][0], idx[i][1] ] = 1
-        self.image_shifter_origin.weight.data[0] = t
+    def gauss_weight_patch_ssd(self, vec, mask):
+        vec = gaussian_blur(vec, 
+                          (self.filt_s, self.filt_s),
+                          (self.sigma, self.sigma))
+        #vec = th.masked_fill(vec, mask, 0)
+        return vec
 
 
     def forward(self, orig, mask):
-        orig_shifted = self.image_shifter_origin(orig)
-        # get original image channel stack
-        orig_stack =th.stack([orig_shifted.squeeze(dim=1) for i in range(8)], dim=1)
+        '''
+            get original image channel stack
+            shift images with following kernel:
+            0 0 0
+            0 1 0 
+            0 0 0 
+            -> identity transformation
+        '''
+        orig_R = self.image_shifter_origin_R(orig)
+        shifted_R = self.neighbors_R(orig)
 
-        # get shifted images
-        shifted =self.image_shifter(orig)
+        orig_4 = self.image_shifter_origin_4(orig)
+        shifted_4 = self.neighbors_4(orig)
 
-        # get image diff
-        diff_images =shifted -orig_stack
-        # diff's L2 norm
-        Dx_alpha =self.summation_patcher(th.pow(diff_images, 2.0))
-        Dx_alpha = th.masked_fill(Dx_alpha, mask, 0)
+        # noise estimate in the local region
+        Vx = self.gauss_weight_patch_ssd((orig_4 - shifted_4)**2, mask)
+        Vx = th.mean(Vx, dim=1)[0]
 
-        # calc neighbor's variance
-        nbrs = self.neighbors(orig)
-
-        nbrs_stack =th.stack([orig_shifted.squeeze(dim=1) for i in range(4)], dim=1)
-
-        nbrs = th.pow(nbrs - nbrs_stack,2.0)
-        ''' gaussian weight '''
-        neighbor_images =self.neighbor_summation_patcher(nbrs)
-        neighbor_images = th.masked_fill(neighbor_images, mask, 0)
-        Vx = th.mean(neighbor_images, dim=1)[0]
+        #clip values for Vx
         val0 = 0.001 * (th.mean(th.masked_select(Vx,~mask[0,0])))
-        val1 = 1000. * th.mean(th.masked_select(Vx,~mask[0,0]))
-
+        val1 = 1000. * (th.mean(th.masked_select(Vx,~mask[0,0])))
         Vx = th.min(th.max(Vx, val0), val1)
-#        Vx =neighbor_images.var(dim =1).unsqueeze(dim =1)
 
+        # calculated mind for R neighborhood
+        Dx = self.gauss_weight_patch_ssd((orig_R - shifted_R)**2, mask)
+        nume = th.exp(-Dx / (Vx + 1e-12))
 
-        nume = th.exp(-Dx_alpha / (Vx + 1e-12))
-        denomi = nume.sum(dim=1).unsqueeze(dim=1)
-        mind = nume / (denomi+1e-12)
+        # normalize descriptors to max 1
+        n = th.amax(nume, dim=(2,3), keepdim=True)
+        mind = nume / n
+
         return mind
+
+
+class LSSDescriptor(th.nn.Module):
+    def __init__(self, device):
+        self.bins = 80
+        self.patch_size = (40*2+1)
+        self.locality = 5
+        self.var_noise = 1
+        self.var_auto = 1
+        self._device = device
+        self.u_label, self.idx = self.generate_log_polar_bins()
+
+    def forward(self, img):
+        # unfold x to patch_sizexpatch_size 
+        # pad images with patchsize//2
+        B, C, W, H = img.shape
+        img = F.pad(img, (self.patch_size//2, self.patch_size//2, 
+                          self.patch_size//2, self.patch_size//2))
+        PS = self.patch_size
+
+        patches = F.unfold(img, (self.patch_size, self.patch_size)).view(B, self.patch_size, self.patch_size, -1)
+
+        # center patches 
+        c = self.patch_size // 2
+        w = (self.locality-1) // 2
+        h = (self.locality-1) // 2
+        center_patches = patches[:,c-w:c+w+1, c-h:c+h+1]
+        patches = patches.permute(3,0,1,2)
+
+        N = center_patches.shape[-1]
+        center_patches = center_patches.permute(3,0,1,2)
+        # merge batch and number of patches [B*N, 1, PS, PS]
+        BN_patches = patches.permute(0,3,1,2).view(-1, 1, self.patch_size, self.patch_size)
+        local_patches = F.unfold(BN_patches, (self.locality, self.locality)).view(B, self.locality, self.locality, -1)
+        local_patches = local_patches.view(1, self.locality, self.locality, B, N, -1)
+        local_patches = local_patches.permute(3, 0, 4, 5, 1, 2)
+        local_patches = local_patches.view(B*N, -1, self.locality, self.locality)
+
+        # ssd [N, M , 5, 5]
+        _, M, _, _ = local_patches.shape
+        # N = image shape folded by patchsize x patchsize 
+
+        ssd = th.mul(center_patches, local_patches)
+        # back to patche
+        ssd = ssd.view(B*N, M, self.locality*self.locality).permute(0,2,1) #[B*N, L**2, M]
+        ssd = F.fold(ssd, (PS,PS), self.locality)   #[B*N, 1, P, P]
+        
+        auto_local_patches = [] 
+        for dw in range(-1, 2):
+            for dh in range(-1,2):
+                if not(dh == 0 and dw == 0):
+                    auto_local_patches.append(patches[:,:,c-w-dw:c+w-dw+1, c-h-dh:c+h-dh+1])
+
+        auto_local_patches = th.stack(auto_local_patches, axis=1).squeeze()
+        cps = center_patches.repeat(1, 8, 1, 1)
+        var_auto_q = th.max(th.var((cps - auto_local_patches), axis=(2,3)), axis=1)[0]
+
+        v_noise = self.var_noise * th.ones_like(var_auto_q)
+        reg = th.maximum(v_noise, var_auto_q).view(-1,1,1,1)
+        corr = th.exp(- ssd / reg)
+        #  to log polar
+
+        # TODO: bin order???
+        neg = th.zeros_like(self.idx, device=self._device, dtype=th.float32)
+
+        s_q = th.stack([bmax(th.where(self.idx==id, corr, neg), dim=(1,2)) for id in self.u_label], dim=1)
+        s_q = s_q.reshape(B, W, H, -1)
+
+        # normalize to [0..1]
+        s_q = s_q / s_q.max(-1)[0].unsqueeze(-1)
+
+
+        return s_q
+
+    def generate_log_polar_bins(self):
+        x = th.linspace(-(self.patch_size//2), self.patch_size//2, self.patch_size, device=self._device)
+        y = th.linspace(-(self.patch_size//2), self.patch_size//2, self.patch_size, device=self._device)
+        cart_coord_x, cart_coord_y = th.meshgrid(x,y)
+
+        # polar coords for each grid point are [r,d]
+        # either log here or at r_bins
+        r = th.sqrt(cart_coord_x**2 + cart_coord_y**2)
+        #r = th.log(th.sqrt(cart_coord_x**2 + cart_coord_y**2)+1e-6)
+        d = th.atan2(cart_coord_y, cart_coord_x)
+
+        # bin into 20 angles, 4 distances (log)
+        r_min = th.min(r)
+        r_max = th.tensor(self.patch_size//2)
+   
+        #TODO: LOGSPACE!
+        #r_bins = th.linspace(r_min+1e-4, r_max+(1e-4), 5)
+        r_bins = th.linspace(-1e-4, r_max+(1e-4), 4, device=self._device)
+        d_bins = th.linspace(-th.pi, th.pi, 21, device=self._device)
+        r_bins[0] -= 1e-4
+        d_bins[0] -= 1e-4
+        r_idx = th.bucketize(r, r_bins)
+        d_idx = th.bucketize(d, d_bins)
+        # 4 r + 20 d
+        idx = r_idx * 100 + d_idx
+
+        u_label, u_idx = th.unique(idx, return_inverse=True)
+        return u_label, idx
+
+import matplotlib.pyplot as plt
+
+class LSSDescriptorV2(th.nn.Module):
+    def __init__(self, 
+                patch_size = 21, 
+                locality = 5,
+                device=th.device('cuda:0'),
+                ) -> None:
+        super().__init__()
+        self.bins = 80
+        self.patch_size = patch_size
+        self.locality = locality
+        self.var_noise = 0.1
+        self._device = device
+        LS = locality
+        LSS = LS**2
+        LSH = (LS-1)//2
+        PS = patch_size
+        PSS = PS**2
+
+
+
+        self.shift_noise_estimator = th.nn.Conv2d(in_channels = 8,
+                                        out_channels = LSS*8,
+                                        kernel_size = (LS+2, LS+2),
+                                        stride=1,
+                                        padding=((LS+1)//2, (LS+1)//2),
+                                        dilation=1, 
+                                        groups=8,
+                                        bias=False, 
+                                        padding_mode='zeros',
+                                        device=self._device)
+        filter = 0
+        for k in range(3): 
+            for l in range(3): 
+                for i in range(LS):
+                    for j in range(LS):
+                        if k != 1 and l != 1:
+                            t = th.zeros((1, LS+2, LS+2))
+                            t[0, l+i, k+j] = 1
+                            self.shift_noise_estimator.weight.data[filter] = t
+                            self.shift_noise_estimator.weight.requires_grad = False
+                            filter += 1
+
+        self.center_patch =th.nn.Conv2d(in_channels = 1, 
+                                        out_channels = LSS,
+                                        kernel_size = (LS, LS),
+                                        stride=1,
+                                        padding=((LS-1)//2, (LS-1)//2),
+                                        dilation=1, 
+                                        groups=1,
+                                        bias=False, 
+                                        padding_mode='zeros',
+                                        device=self._device)
+
+        filter = 0
+        for i in range(LS):
+            for j in range(LS):
+                t =th.zeros((1, LS, LS))
+                t[0, i, j] = 1
+                self.center_patch.weight.data[filter] = t
+                self.center_patch.weight.requires_grad = False
+                filter += 1
+    
+    
+        KS_q = (PS+LS-1)
+        self.KS = KS_q
+        self.KSS = KS_q-LS
+        #TS_q = KS_q - LS
+        #self.TS_q = TS_q
+        #pdb.set_trace()
+        # calc shifted images in non local region
+        self.shift_region_q =th.nn.Conv2d(in_channels = LSS, 
+                                        out_channels = LSS*(KS_q-LS)**2,
+                                        kernel_size = KS_q, 
+                                        stride=1,
+                                        padding=(KS_q-1)//2,
+                                        dilation=1, 
+                                        groups=LSS,
+                                        bias=False, 
+                                        padding_mode='zeros',
+                                        device=self._device)
+        # shift all offsets trough
+        filter = 0
+        for top in range(KS_q-LS):
+            for left in range(KS_q-LS):
+                for i in range(LS):
+                    for j in range(LS):
+                        # fill in LS*LS shift operations
+                        t =th.zeros((1, KS_q, KS_q))
+                        t[0, top+i, left+j] = 1
+                        self.shift_region_q.weight.data[filter] = t
+                        self.shift_region_q.weight.requires_grad = False
+                        filter += 1
+        
+        self.shift_region_l =th.nn.Conv2d(in_channels = ((KS_q-LS)**2), 
+                                        out_channels = LSS*((KS_q-LS)**2),
+                                        kernel_size = (LS, LS),
+                                        stride=1,
+                                        padding=(LS-1)//2,
+                                        dilation=1, 
+                                        groups=((KS_q-LS)**2), 
+                                        bias=False, 
+                                        padding_mode='zeros',
+                                        device=self._device)
+
+        filter = 0
+        for _ in range(KS_q-LS):
+            for _ in range(KS_q-LS):
+                for i in range(LS):
+                    for j in range(LS):
+                        t =th.zeros((1, LS, LS))
+                        t[0, i, j] = 1
+                        self.shift_region_l.weight.data[filter] = t
+                        self.shift_region_l.weight.requires_grad = False
+                        filter += 1
+
+        self.sum =th.nn.Conv2d(in_channels = LSS*((KS_q-LS)**2), 
+                                out_channels = (KS_q-LS)**2,
+                                kernel_size = (LS, LS),
+                                stride=1,
+                                padding=((LS-1)//2, (LS-1)//2),
+                                dilation=1, 
+                                groups=(KS_q-LS)**2, 
+                                bias=False, 
+                                padding_mode='zeros',
+                                device=self._device)
+        self.sum.weight.data.fill_(1.0)
+        self.sum.weight.requires_grad = False
+
+        self.u_label, self.idx = generate_log_polar_bins(self.KS-LS, self._device)
+   
+    def forward(self, x, label):
+        '''
+            LS -> Local Window (region around q)
+            PS -> surrounding image region centered at q
+        '''
+        LS = self.locality
+        PS = self.patch_size
+        LSS = LS**2
+        PSS = PS**2
+        KSS = (self.KS-LS)**2
+        B, C, W, H = x.shape
+        x_lss   = x.repeat(1, LSS, 1, 1)
+        x_kss   = x.repeat(1, KSS, 1, 1)
+        x_noise = x.repeat(1, 8, 1, 1)
+        
+        region_q = self.shift_region_q(x_lss)
+        region_l = self.shift_region_l(x_kss)
+
+        # [B, 8*LSS, W, H]
+        region_noise        = self.shift_noise_estimator(x_noise)
+        region_noise_center = self.center_patch(x).repeat(1,8,1,1)
+        noise = region_noise - region_noise_center
+        noise = noise.reshape(B, 8, LSS, W, H)
+        var = th.std(noise, dim=2) #estimate
+        var_auto_q = bmax(var, dim=(1,))
+        # [B, PS**2, W, H]
+        #var_auto_q = th.std((region_noise - region_noise_center), dim=1)
+
+        # sum of squared diff
+        s_d = (region_q - region_l)**2
+        s_d = self.sum(s_d)     
+        # noise normalized
+        reg = (th.max(self.var_noise*th.ones_like(var_auto_q), var_auto_q))
+        s_q = th.exp(-(s_d)/reg)
+        s_q = s_q.reshape(B, self.KS-LS, self.KS-LS, W, H)
+
+        for x in [10, 20, 30]:
+            for y in [10, 20, 30]:
+                plt.matshow(s_q[0,:,:,x, y].detach().cpu().numpy())
+                plt.colorbar()
+                plt.savefig('{}_{}_{}.png'.format(label, x,y), dpi=400)
+        # [B, PSS, W, H]
+        # bin PSS into 80 buckets - 4 lenght, 20 angle
+        # TODO: bin order???
+        idx = self.idx.repeat(B, 1, 1, W, H)
+        neg = th.zeros_like(idx, device=self._device, dtype=th.float32)
+        s_q = th.stack([bmax(th.where(idx==id, s_q, neg), dim=(1,2)) for id in self.u_label], dim=1)
+        s_q = s_q.reshape(B, W, H, -1)
+
+        # normalize to [0..1]
+        #s_q = s_q / s_q.max(-1)[0].unsqueeze(-1)
+        pdb.set_trace()
+        return s_q
+
+def generate_log_polar_bins(patch_size, device, n_angle_bins=20, n_dist_bins=4):
+    x = th.linspace(-(patch_size//2), patch_size//2, patch_size, device=device)
+    y = th.linspace(-(patch_size//2), patch_size//2, patch_size, device=device)
+    cart_coord_x, cart_coord_y = th.meshgrid(x,y)
+
+    # polar coords for each grid point are [r,d]
+    # either log here or at r_bins
+    r = th.sqrt(cart_coord_x**2 + cart_coord_y**2)
+    #r = th.log(th.sqrt(cart_coord_x**2 + cart_coord_y**2)+1e-6)
+    d = th.atan2(cart_coord_y, cart_coord_x)
+
+    # bin into 20 angles, 4 distances (log)
+    r_min = th.min(r)
+    r_max = th.tensor(patch_size//2)
+
+    #TODO: LOGSPACE!
+    #r_bins = th.linspace(r_min+1e-4, r_max+(1e-4), 5)
+    r_bins = th.linspace(-1e-4, r_max+(1e-4), n_dist_bins, device=device)
+    d_bins = th.linspace(-th.pi, th.pi, n_angle_bins+1, device=device)
+    r_bins[0] -= 1e-4
+    d_bins[0] -= 1e-4
+    r_idx = th.bucketize(r, r_bins)
+    d_idx = th.bucketize(d, d_bins)
+    # 4 r + 20 d
+    idx = r_idx * 100 + d_idx
+    u_label, u_idx = th.unique(idx, return_inverse=True)
+    r_range = [x for x in range(1, n_dist_bins+1)]
+    d_range = [x for x in range(1, n_angle_bins+1)]
+    u_label = [n_dist_bins * x + n_angle_bins * y for (x,y) in product(r_range, d_range)]
+    idx = idx.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)  #add batch dim and pseudo w,h
+    return u_label, idx
+
+
+def bmax(t, dim=(1,2), keepdim=False):
+    '''
+        reduces tensor t along all dimensions except the batch bim [0]
+    '''
+    for d in dim:
+        t = th.max(t, d, keepdim=True)[0]
+
+    if not keepdim:
+        for d in reversed(dim):
+            t = t.squeeze(d)
+    return t
+
+
+
+
+class LSS(_PairwiseImageLoss):
+    def __init__(self, 
+                 fixed_image,
+                 moving_image,
+                 fixed_mask=None, 
+                 moving_mask=None, 
+                 size_average=True, 
+                 reduce=True,
+                 debug=False):
+        super(LSS, self).__init__(fixed_image, moving_image, fixed_mask, moving_mask, size_average, reduce)
+
+        self._device = fixed_image.device
+        self.debug = debug
+        self._moving_mask = moving_mask.to(self._device)
+        self._fixed_mask = fixed_mask.to(self._device)
+
+        self.LSSDesc = LSSDescriptorV2(device=self._device)
+        self.lss_fixed  = self.LSSDesc.forward(self._fixed_image.image, 'fix')
+
+        self.t = 0
+ 
+    def forward(self, displacement):
+        displacement = self._grid + displacement
+        # warp moving image with dispalcement field and warp masks
+        self._warped_moving_image = F.grid_sample(self._moving_image.image, displacement)
+        self._warped_moving_mask = F.grid_sample(self._moving_mask.to(th.float32), displacement, padding_mode='border').to(bool)
+        mask = (self._warped_moving_mask | self._fixed_mask).to(self._device)
+
+        # get LSS descriptors
+        mov_lss = self.LSSDesc.forward(self._warped_moving_image, 'mov')
+         
+
+        LSS_diff = th.abs(mov_lss - self.lss_fixed).mean(-1)
+
+        LSS_diff = th.masked_fill(LSS_diff, mask.squeeze(0), 0).mean()
+        print(LSS_diff)
+
+        if self.debug and self.t % 5 ==0:
+            mov = (self._warped_moving_image).cpu().detach().numpy()[0, 0]
+            fix = (self._fixed_image.image).cpu().detach().numpy()[0, 0]
+
+            cv2.imwrite('tmp/{}_{}.png'.format(self._fixed_image.image.shape, self.t), (np.dstack((mov,fix,mov))*255).astype(np.uint8))
+        self.t += 1
+
+        return LSS_diff
+
+
+
